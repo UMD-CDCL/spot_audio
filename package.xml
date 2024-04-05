@@ -18,6 +18,7 @@
 
   <depend>angles</depend>
   <depend>audio_common_msgs</depend>
+  <depend>cdcl_umd_msgs</depend>
   <depend>geometry_msgs</depend>
   <depend>portaudio19-dev</depend>
   <depend>python3-pyaudio</depend>
