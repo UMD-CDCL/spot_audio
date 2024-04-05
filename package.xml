@@ -1,9 +1,9 @@
 <?xml version="1.0"?>
 <package format="2">
-  <name>respeaker_ros</name>
-  <version>1.0.0</version>
-  <description>ROS interface for respeaker.</description>
-  <maintainer email="nswalker@cs.washington.edu">Nick Walker</maintainer>
+  <name>spot_audio</name>
+  <version>0.0.1</version>
+  <description>ROS interface for respeaker microphone, generic speaker, and text-to-speech.</description>
+  <maintainer email="zbortoff@umd.edu">Zach Bortoff</maintainer>
   <license>MIT</license>
 
   <exec_depend>rclpy</exec_depend>
