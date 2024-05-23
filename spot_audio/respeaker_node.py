@@ -92,7 +92,7 @@ class RespeakerNode(Node):
         self._pub_speech = self.create_publisher(Speech, 'speech_audio', 10)
 
         # publishes whether a person is actively speaking
-        self._pub_speech_activity = self.create_publisher(SpeechActivity, 'speech_activity', 10)
+        self._pub_speech_activity = self.create_publisher(SpeechActivity, 'triage/speech_activity', 10)
 
         # a timer callback to be called frequently enough to determine if someone is actively speaking
         self._timer = self.create_timer(self.update_period_s.value, self.on_timer)

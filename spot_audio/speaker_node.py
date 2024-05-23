@@ -26,7 +26,7 @@ from os.path import exists
 class SpeakerNode(Node):
     def __init__(self):
         super().__init__('speaker_node')
-        self.play_sound_srv_ = self.create_service(PlaySound, 'play_sound', self.play_sound_callback)
+        self.play_sound_srv_ = self.create_service(PlaySound, 'play_sound_external', self.play_sound_callback)
 
     def play_sound_callback(self, request, response):
         file_name = request.file_name
