@@ -3,7 +3,7 @@ import struct
 import usb.core
 import usb.util
 
-from respeaker_ros.parameters import PARAMETERS
+from spot_audio.parameters import PARAMETERS
 
 
 class RespeakerInterface(object):
@@ -99,6 +99,12 @@ class RespeakerInterface(object):
 
     def set_vad_threshold(self, db):
         self.write('GAMMAVAD_SR', db)
+    
+    def get_vad_threshold(self):
+        return self.read('GAMMAVAD_SR')
+
+    def is_speech(self):
+        return self.read('SPEECHDETECTED')
 
     def is_voice(self):
         return self.read('VOICEACTIVITY')
