@@ -21,7 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'respeaker_node = spot_audio.respeaker_node:main',
-            'speaker_node = spot_speaker.speaker_node:main',
+            'speaker_node = spot_audio.speaker_node:main',
         ],
     },
 )

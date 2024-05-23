@@ -1,9 +1,21 @@
 #!/usr/bin/env python3
 
 
+"""
+aplay -L
 
-# ros2 service call /play_sound cdcl_umd_msgs/srv/PlaySound "{file_name: '/home/cdcl/cdcl_ws/src/spot_speaker/data/diagnostics.wav'}
+plughw:CARD=ArrayUAC10,DEV=0
+    ReSpeaker 4 Mic Array (UAC1.0), USB Audio
+    Hardware device with all software conversions
 
+aplay -D plughw <file>
+"""
+
+
+# ros2 service call /play_sound cdcl_umd_msgs/srv/PlaySound "{file_name: '/home/cdcl/cdcl_ws/src/cdcl_autonomy_stack/spot_audio/data/introduction.wav'}"
+# ros2 service call /play_sound cdcl_umd_msgs/srv/PlaySound "{file_name: '/home/cdcl/cdcl_ws/src/cdcl_autonomy_stack/spot_audio/data/assistance_prompt.wav'}"
+# ros2 service call /play_sound cdcl_umd_msgs/srv/PlaySound "{file_name: '/home/cdcl/cdcl_ws/src/cdcl_autonomy_stack/spot_audio/data/stay_still.wav'}"
+# ros2 service call /play_sound cdcl_umd_msgs/srv/PlaySound "{file_name: '/home/cdcl/cdcl_ws/src/cdcl_autonomy_stack/spot_audio/data/exit.wav'}"
 
 import rclpy
 from rclpy.node import Node
@@ -34,7 +46,7 @@ class SpeakerNode(Node):
         return response
     
     def play_sound(self, file):
-        subprocess.call(["aplay", "-D", "plughw:1,0", file])
+        subprocess.call(["aplay", "-D", "plughw", file])
 
 
 def main(args=None):
