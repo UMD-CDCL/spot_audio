@@ -119,7 +119,6 @@ class RespeakerNode(Node):
         self.language = 'en'
         self.task = 'transcribe'
         self.initial_prompt = None
-        self.get_logger().info('self.speech_prefetch_bytes: {0}'.format(self.speech_prefetch_bytes))
         self.vad_parameters={
             'threshold': 0.3,  # lower bound: 0.2, sweet spot: 0.3, upper bound: 0.4
             'min_speech_duration_ms': int(1000.0 * self.speech_min_duration.value),
@@ -184,7 +183,7 @@ class RespeakerNode(Node):
             speech_msg.raw_audio = buffered_speech.tolist()
 
             # print the transcript for convenience
-            self.get_logger().info("Transcript {0}".format(transcript))
+            # self.get_logger().info("Transcript {0}".format(transcript))
 
             # use direction-of-arrival estimate to compute quaternion of speaker in microphone frame
             orientation = T.quaternion_from_euler(doa_rad, 0, 0)
