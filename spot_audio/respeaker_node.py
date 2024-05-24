@@ -164,7 +164,8 @@ class RespeakerNode(Node):
         transcript = self.transcribe_speech(buffered_speech).strip()
 
         # determine if we detected speech
-        speech_detected = int(transcript != '' and transcript != 'Thanks for watching!')
+        # TODO: IGNORE "Thank you"
+        speech_detected = int(transcript != '' and 'Thank' not in transcript)
 
         # publish whether speech was detected
         speech_activity = SpeechActivity()
