@@ -100,7 +100,7 @@ class SpeakerNode(Node):
         channel_count = wav.getnchannels()
         frame_rate = wav.getframerate()
         wav.close()
-        return frame_count / float(frame_rate * channel_count)
+        return frame_count / float(frame_rate)
 
     def play_sound_callback(self, request, response):
         """
@@ -129,7 +129,7 @@ class SpeakerNode(Node):
         right_now = self.get_clock().now()
         stop_listening_request.stop_listen_time = right_now.to_msg()
         # stop_listening_request.start_listen_time = (right_now + Duration(seconds=duration_s + 0.2)).to_msg()
-        stop_listening_request.start_listen_time = (right_now + Duration(seconds=duration_s - 0.1)).to_msg()
+        stop_listening_request.start_listen_time = (right_now + Duration(seconds=duration_s - 0.5)).to_msg()
         self.stop_listening_client_.call_async(stop_listening_request)  # we don't even care about the result, so don't even wait for it.
 
         # play the sound through the speaker
