@@ -129,7 +129,7 @@ class SpeakerNode(Node):
         right_now = self.get_clock().now()
         stop_listening_request.stop_listen_time = right_now.to_msg()
         # stop_listening_request.start_listen_time = (right_now + Duration(seconds=duration_s + 0.2)).to_msg()
-        stop_listening_request.start_listen_time = (right_now + Duration(seconds=duration_s)).to_msg()
+        stop_listening_request.start_listen_time = (right_now + Duration(seconds=duration_s - 0.1)).to_msg()
         self.stop_listening_client_.call_async(stop_listening_request)  # we don't even care about the result, so don't even wait for it.
 
         # play the sound through the speaker
