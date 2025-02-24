@@ -419,7 +419,7 @@ class MicrophoneLifecycleNode(Node):
 
             # publish the verbal alertness classification, if it's non-verbal vocalization and we didn't send last time
             if not self.sent_non_verbal_last_time:
-                if predicted_labels['alertness_verbal'] == 1:
+                if predicted_labels['alertness_verbal'] == 1 or predicted_labels['alertness_verbal'] == 0:
                     alertness_observation = Observation()
                     alertness_observation.unique_id = unique_id
                     alertness_observation.stamp = first_time_stamp.to_msg()

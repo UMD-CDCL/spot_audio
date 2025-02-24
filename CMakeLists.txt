@@ -44,6 +44,17 @@ install(
     DESTINATION lib/${PROJECT_NAME}
 )
 
+# install the Python executables
+install(
+    PROGRAMS ${PROJECT_NAME}/speaker_lifecycle_node.py
+    DESTINATION lib/${PROJECT_NAME}
+)
+
+install(
+    DIRECTORY ${PROJECT_NAME}/speaker
+    DESTINATION lib/${PROJECT_NAME}
+)
+
 
 # install launch file
 install(
