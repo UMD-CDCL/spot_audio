@@ -151,9 +151,9 @@ class SpeakerNode(Node):
             # if we are in "active" state but microphone isn't loaded, that's a problem.
             status = diagnostic_msgs.msg.DiagnosticStatus.ERROR
             summary_msg = 'Speaker not connected'
-            stat.add('connected_to_microphone', 'false')
+            stat.add('connected_to_speaker', 'false')
         else:
-            stat.add('connected_to_microphone', 'true')
+            stat.add('connected_to_speaker', 'true')
 
         # check if whisper loaded
         if self.xtts_model_ is None:

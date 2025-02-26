@@ -222,6 +222,7 @@ class MicrophoneLifecycleNode(Node):
         self.get_logger().info(f"Created microphone stream.")
         self.microphone.start_stream()
         self.get_logger().info(f"Started microphone stream.")
+        self.get_logger().info(f"Node \"{self.get_name()}\" transitioned to \"activate\".")
         return TransitionCallbackReturn.SUCCESS
 
     def on_deactivate(self, state: State) -> TransitionCallbackReturn:
