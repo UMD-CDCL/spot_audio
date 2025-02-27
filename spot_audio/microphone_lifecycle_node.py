@@ -18,8 +18,10 @@ import random
 import rclpy
 from rclpy.duration import Duration
 from rclpy.lifecycle import Node, State, TransitionCallbackReturn, LifecycleState
+import sys
 from scipy.signal import resample
 from threading import Lock
+import time
 import uuid
 
 
@@ -89,6 +91,69 @@ class MicrophoneLifecycleNode(Node):
         # declare the whisper model
         self.transcriber = None
 
+        # configure
+        self._declare_parameters()
+        self._create_publishers()
+        self._create_timers()
+        self._create_services()
+
+        # reset the main buffer so we don't process audio from previous time this node ran
+        self._reset_audio_data()
+
+        # initialize these start/stop listening stamps
+        self.stop_listening_start_time = self.get_clock().now()
+        self.stop_listening_stop_time = self.get_clock().now()
+
+        # try connecting to the audio device, if we fail, then return FAILURE, otherwise continue
+        self.microphone = MicrophoneDevice(self.on_received_audio, self.get_logger(), self.get_parameter('microphone_sampling_freq_hz').value)
+        self.microphone.create_pyaudio()
+        if not self.microphone.find_device(self.get_parameter('microphone_name').value):
+            self.get_logger().fatal("Failed to find audio device with matching name.")
+            while True:
+                time.sleep(1)
+
+        self.get_logger().info(f"Found microphone at device index \"{self.microphone.device_index}\". Creating stream.")
+
+        # try loading classifier model, if we fail, then return FAILURE, otherwise continue
+        self.audio_classification_strategy = MaxArgStrategy(self.get_parameter('path_to_classifier').value, self.get_logger())
+        if not self.audio_classification_strategy.load_classifier():
+            self.get_logger().error("Failed to load classifiers. Not transitioning to \"active\".")
+            self.stop_listening_start_time = None
+            self.stop_listening_stop_time = None
+            self.microphone.destroy_pyaudio()
+            # loop indefinitely
+            while True:
+                time.sleep(1)
+
+
+
+        # try loading whisper model, if we fail, then return FAILURE, otherwise continue
+        self.vad_parameters = {
+            'threshold': 0.2,  # lower bound: 0.2, sweet spot: 0.3, upper bound: 0.4
+            'min_speech_duration_ms': int(1000.0 * self.get_parameter('speech_min_duration').value),
+            'max_speech_duration_s': self.get_parameter('speech_max_duration').value,
+            'min_silence_duration_ms': int(1000.0 * self.get_parameter('speech_continuation').value),
+            'window_size_samples': 1536
+        }
+        if os.path.isdir(self.get_parameter('path_to_whisper').value):
+            self.get_logger().info(f"Loading Whisper model from disk.")
+            self.transcriber = WhisperModel(self.get_parameter('path_to_whisper').value, device=self.device, compute_type='int8', local_files_only=False)
+        else:
+            self.get_logger().info(f"Couldn't find Whisper model on disk. Downloading it from the internet.")
+            self.transcriber = WhisperModel(self.model_size, device=self.device, compute_type='int8', local_files_only=False)
+
+
+        # initialize audio prefetch buffer
+        self.audio_prefetch_bytes = int(self.get_parameter('speech_prefetch').value * self.microphone.rate * self.microphone.bitdepth / 8.0)
+        self.audio_prefetch_buffer = np.zeros(self.audio_prefetch_bytes, dtype=np.uint8)
+
+        # start streaming audio data immediately
+        self.microphone.create_stream()
+        self.get_logger().info(f"Created microphone stream.")
+        self.microphone.start_stream()
+        self.get_logger().info(f"Started microphone stream.")
+        self.get_logger().info(f"Node \"{self.get_name()}\" transitioned to \"activate\".")
+
     def produce_diagnostics(self, stat):
         # define nominal diagnostic status
         status = diagnostic_msgs.msg.DiagnosticStatus.STALE
@@ -136,143 +201,8 @@ class MicrophoneLifecycleNode(Node):
 
         stat.summary(status, summary_msg)
         return stat
-
-    def on_configure(self, state: State) -> TransitionCallbackReturn:
-        """
-        According to nav2 documentation (https://docs.nav2.org/concepts/index.html#lifecycle-nodes-and-bond) setup all
-        parameters and ROS networking interfaces
-        :param state:
-        :return: whether we successfully finished the function
-        """
-        self.get_logger().info(f"Node \"{self.get_name()}\" is in state \"{state.label}\". Transitioning to \"configure\".")
-        self.initial_unconfigured_state = False
-        self._declare_parameters()
-        self._create_publishers()
-        self._create_timers()
-        self._create_services()
-        return TransitionCallbackReturn.SUCCESS
-
-    def on_cleanup(self, state: LifecycleState) -> TransitionCallbackReturn:
-        """
-        should do the "reverse" of the "on_configure" function; see https://design.ros2.org/articles/node_lifecycle.html
-        :param state: the state we are leaving
-        :return: whether we successfully finished the function
-        """
-        self.get_logger().info(f"Node \"{self.get_name()}\" is in state \"{state.label}\". Transitioning to \"configure\".")
-        self._on_cleanup()
-        return TransitionCallbackReturn.SUCCESS
-
-    def _on_cleanup(self):
-        self._undeclare_parameters()
-        self._destroy_publishers()
-        self._destroy_timers()
-        self._destroy_services()
-
-    def on_activate(self, state: State) -> TransitionCallbackReturn:
-        self.get_logger().info(f"Node \"{self.get_name()}\" is in state \"{state.label}\". Transitioning to \"activate\".")
-
-        # reset the main buffer so we don't process audio from previous time this node ran
-        self._reset_audio_data()
-
-        # initialize these start/stop listening stamps
-        self.stop_listening_start_time = self.get_clock().now()
-        self.stop_listening_stop_time = self.get_clock().now()
-
-        # try connecting to the audio device, if we fail, then return FAILURE, otherwise continue
-        self.microphone = MicrophoneDevice(self.on_received_audio, self.get_logger(), self.get_parameter('microphone_sampling_freq_hz').value)
-        self.microphone.create_pyaudio()
-        if not self.microphone.find_device(self.get_parameter('microphone_name').value):
-            self.get_logger().error("Failed to find audio device with matching name. Not transitioning to \"active\".")
-            self.stop_listening_start_time = None
-            self.stop_listening_stop_time = None
-            return TransitionCallbackReturn.FAILURE
-        self.get_logger().info(f"Found microphone at device index \"{self.microphone.device_index}\". Creating stream.")
-
-        # try loading classifier model, if we fail, then return FAILURE, otherwise continue
-        self.audio_classification_strategy = MaxArgStrategy(self.get_parameter('path_to_classifier').value, self.get_logger())
-        if not self.audio_classification_strategy.load_classifier():
-            self.get_logger().error("Failed to load classifiers. Not transitioning to \"active\".")
-            self.stop_listening_start_time = None
-            self.stop_listening_stop_time = None
-            self.microphone.destroy_pyaudio()
-            return TransitionCallbackReturn.FAILURE
-
-        # try loading whisper model, if we fail, then return FAILURE, otherwise continue
-        self.vad_parameters = {
-            'threshold': 0.2,  # lower bound: 0.2, sweet spot: 0.3, upper bound: 0.4
-            'min_speech_duration_ms': int(1000.0 * self.get_parameter('speech_min_duration').value),
-            'max_speech_duration_s': self.get_parameter('speech_max_duration').value,
-            'min_silence_duration_ms': int(1000.0 * self.get_parameter('speech_continuation').value),
-            'window_size_samples': 1536
-        }
-        if os.path.isdir(self.get_parameter('path_to_whisper').value):
-            self.get_logger().info(f"Loading Whisper model from disk.")
-            self.transcriber = WhisperModel(self.get_parameter('path_to_whisper').value, device=self.device, compute_type='int8', local_files_only=False)
-        else:
-            self.get_logger().info(f"Couldn't find Whisper model on disk. Downloading it from the internet.")
-            self.transcriber = WhisperModel(self.model_size, device=self.device, compute_type='int8', local_files_only=False)
-
-
-        # initialize audio prefetch buffer
-        self.audio_prefetch_bytes = int(self.get_parameter('speech_prefetch').value * self.microphone.rate * self.microphone.bitdepth / 8.0)
-        self.audio_prefetch_buffer = np.zeros(self.audio_prefetch_bytes, dtype=np.uint8)
-
-        # start streaming audio data immediately
-        self.microphone.create_stream()
-        self.get_logger().info(f"Created microphone stream.")
-        self.microphone.start_stream()
-        self.get_logger().info(f"Started microphone stream.")
-        self.get_logger().info(f"Node \"{self.get_name()}\" transitioned to \"activate\".")
-        return TransitionCallbackReturn.SUCCESS
-
-    def on_deactivate(self, state: State) -> TransitionCallbackReturn:
-        self.get_logger().info(f"Node \"{self.get_name()}\" is in state \"{state.label}\". Transitioning to \"deactivate\".")
-        self._on_deactivate()
-        return TransitionCallbackReturn.SUCCESS
-
-    def _on_deactivate(self):
-        if self.microphone is not None:
-            self.microphone.stop_stream()
-            self.get_logger().info(f"Microphone stream stopped.")
-            self.microphone.destroy_stream()
-            self.get_logger().info(f"Microphone stream destroyed.")
-            self.microphone.destroy_pyaudio()
-            self.get_logger().info(f"Pyaudio destroyed.")
-            self.microphone = None
-            self.audio_classification_strategy = None
-            self.vad_parameters = None
-            self.transcriber = None
-            self.audio_prefetch_bytes = None
-            self.audio_prefetch_buffer = None
-            self.stop_listening_start_time = None
-            self.stop_listening_stop_time = None
-
     def _reset_audio_data(self):
         self.audio_buffer = []
-
-    def on_error(self, state: LifecycleState) -> TransitionCallbackReturn:
-        """
-        if we go to on_error, then we are returning to on_configure, so deactivate (if possibly) and cleanup (if
-        possible)
-        :param state: the state we are coming frome
-        :return:
-        """
-        self.get_logger().error(f"An error occurred in MicrophoneLifeCycleNode.")
-        self._on_deactivate()
-        self._on_cleanup()
-        return TransitionCallbackReturn.SUCCESS
-
-
-    def on_shutdown(self, state: State) -> TransitionCallbackReturn:
-        """
-        you can go to finalized from any state, so make sure we deactivate and cleanup before exiting
-        :param state:
-        :return:
-        """
-        self.get_logger().info(f"Node \"{self.get_name()}\" is in state \"{state.label}\". Transitioning to \"shutdown\".")
-        self._on_deactivate()
-        self._on_cleanup()
-        return TransitionCallbackReturn.SUCCESS
 
     def _declare_parameters(self) -> None:
         self.get_logger().info("Declaring node parameters.")
