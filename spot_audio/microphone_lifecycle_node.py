@@ -24,6 +24,8 @@ from threading import Lock
 import time
 import uuid
 
+import os
+spot_name = os.environ['SPOT_NAME']
 
 
 
@@ -352,6 +354,7 @@ class MicrophoneLifecycleNode(Node):
             if not self.sent_non_verbal_last_time:
                 if predicted_labels['alertness_verbal'] == 1 or predicted_labels['alertness_verbal'] == 0:
                     alertness_observation = Observation()
+                    alertness_observation.platform_name = spot_name #self.get_parameter('robot_name').value
                     alertness_observation.unique_id = unique_id
                     alertness_observation.stamp = first_time_stamp.to_msg()
                     alertness_observation.observer_module = ObserverModule.VIT_VERBAL_ALERTNESS
@@ -363,6 +366,7 @@ class MicrophoneLifecycleNode(Node):
                 # publish the respiratory distress classification, if it's non-verbal vocalization
                 if predicted_labels['respiratory_distress'] == 1:
                     alertness_observation = Observation()
+                    alertness_observation.platform_name = spot_name  #self.get_parameter('robot_name').value
                     alertness_observation.unique_id = unique_id
                     alertness_observation.stamp = first_time_stamp.to_msg()
                     alertness_observation.observer_module = ObserverModule.VIT_RESPIRATORY_DISTRESS
@@ -450,6 +454,7 @@ class MicrophoneLifecycleNode(Node):
 
             # publish an observation corresponding to speech
             alertness_observation = Observation()
+            alertness_observation.platform_name = spot_name  #self.get_parameter('robot_name').value
             alertness_observation.unique_id = unique_id
             alertness_observation.stamp = self.first_heard_speech_stamp.to_msg()
             alertness_observation.observer_module = ObserverModule.WHISPER_VERBAL_ALERTNESS

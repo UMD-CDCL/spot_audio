@@ -40,12 +40,12 @@ class SpeakerNode(Node):
         self.stop_listening_client_ = self.create_client(StopListening, self.stop_listening_service_name_.value)
 
         # initialize the speaker device
-        # self.speaker_device_ = JackSpeakerDevice('alsa_output.pci-0000_00_1f.3.analog-stereo')
-        # self.speaker_device_.set_device('alsa_output.pci-0000_00_1f.3.analog-stereo')
+        self.speaker_device_ = JackSpeakerDevice('alsa_output.pci-0000_00_1f.3.analog-stereo')
+        self.speaker_device_.set_device('alsa_output.pci-0000_00_1f.3.analog-stereo')
 
         # for testing only
-        self.speaker_device_ = JackSpeakerDevice('alsa_output.usb-Generic_USB2.0_Device_20121120222016-00.analog-stereo')
-        self.speaker_device_.set_device('alsa_output.usb-Generic_USB2.0_Device_20121120222016-00.analog-stereo')
+        #self.speaker_device_ = JackSpeakerDevice('alsa_output.usb-Generic_USB2.0_Device_20121120222016-00.analog-stereo')
+        #self.speaker_device_.set_device('alsa_output.usb-Generic_USB2.0_Device_20121120222016-00.analog-stereo')
 
         # initialize the XTTS model
         self.xtts_model_ = None
@@ -128,8 +128,8 @@ class SpeakerNode(Node):
         stop_listening_request = StopListening.Request()
         right_now = self.get_clock().now()
         stop_listening_request.stop_listen_time = right_now.to_msg()
-        # stop_listening_request.start_listen_time = (right_now + Duration(seconds=duration_s + 0.2)).to_msg()
-        stop_listening_request.start_listen_time = (right_now + Duration(seconds=duration_s - 0.5)).to_msg()
+        stop_listening_request.start_listen_time = (right_now + Duration(seconds=duration_s + 0.2)).to_msg()
+        #stop_listening_request.start_listen_time = (right_now + Duration(seconds=duration_s -0.5)).to_msg()
         self.stop_listening_client_.call_async(stop_listening_request)  # we don't even care about the result, so don't even wait for it.
 
         # play the sound through the speaker
