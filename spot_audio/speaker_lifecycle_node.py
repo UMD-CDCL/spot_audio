@@ -3,8 +3,7 @@
 
 from cdcl_umd_msgs.srv import PlaySound
 from cdcl_umd_msgs.srv import StopListening
-import diagnostic_updater
-import diagnostic_msgs
+from std_msgs.msg import Empty
 import os
 import rclpy
 from rclpy.node import Node
@@ -31,13 +30,21 @@ class SpeakerNode(Node):
         # xtts related configuration files
         self.xtts_config_file_ = self.declare_parameter('xtts_config_file', '/home/cdcl/cdcl_ws/models/xtts/config.json')
         self.xtts_speaker_audio_file_ = self.declare_parameter('xtts_speaker_audio_file', '/home/cdcl/cdcl_ws/models/xtts/test.wav')
-        self.xtts_output_file_ = self.declare_parameter('xtts_output_file', '/home/cdcl/cdcl_ws/src/cdcl_dtc_common/data/output.wav')
+        self.xtts_output_file_ = self.declare_parameter('xtts_output_file', '/home/cdcl/cdcl_ws/src/spot_audio/data/output.wav')
 
         # create a service server called 'speak' that accepts PlaySound requests
         self.play_sound_srv_ = self.create_service(PlaySound, self.speech_service_name_.value, self.play_sound_callback)
 
         # create a client for the stop listening service
         self.stop_listening_client_ = self.create_client(StopListening, self.stop_listening_service_name_.value)
+
+        # publish to a heartbeat topic every once in awhile
+        self.empty_pub_ = self.create_publisher(
+            Empty,
+            'speaker/heartbeat',
+            10
+        )
+        self.heartbeat_timer_ = self.create_timer(2.5, self.heartbeat_callback)
 
         # initialize the speaker device
         self.speaker_device_ = JackSpeakerDevice('alsa_output.pci-0000_00_1f.3.analog-stereo')
@@ -59,9 +66,11 @@ class SpeakerNode(Node):
         # generate the first speech, just so the model is warmed up
         self._run_tts('Hello world! This is a test!')
         self._run_tts('I try to generate at least three sounds first')
-        self._run_tts('Ballto is ready to go!')
+        self._run_tts('Spot is ready to go!')
         # self.speaker_device_.play_sound(self.xtts_output_file_.value)
 
+    def heartbeat_callback(self) -> None:
+        self.empty_pub_.publish(Empty())
 
     def _run_tts(self, text: str) -> None:
         """
@@ -141,38 +150,10 @@ class SpeakerNode(Node):
         response.success = True
         return response
 
-    def produce_diagnostics(self, stat):
-        # define nominal diagnostic status
-        status = diagnostic_msgs.msg.DiagnosticStatus.OK
-        summary_msg = 'System active.'
-
-        # check if microphone loaded
-        if self.speaker_device_ is None:
-            # if we are in "active" state but microphone isn't loaded, that's a problem.
-            status = diagnostic_msgs.msg.DiagnosticStatus.ERROR
-            summary_msg = 'Speaker not connected'
-            stat.add('connected_to_speaker', 'false')
-        else:
-            stat.add('connected_to_speaker', 'true')
-
-        # check if whisper loaded
-        if self.xtts_model_ is None:
-            status = diagnostic_msgs.msg.DiagnosticStatus.ERROR
-            summary_msg = 'XTTS not loaded'
-            stat.add('xtts_loaded', 'false')
-        else:
-            stat.add('xtts_loaded', 'true')
-
-        stat.summary(status, summary_msg)
-        return stat
-
 
 def main(args=None):
     rclpy.init(args=args)
     speaker_node = SpeakerNode()
-    updater = diagnostic_updater.Updater(speaker_node)
-    updater.setHardwareID('speaker')
-    updater.add('diagnostics', speaker_node.produce_diagnostics)
     try:
         rclpy.spin(speaker_node)
     except KeyboardInterrupt:
