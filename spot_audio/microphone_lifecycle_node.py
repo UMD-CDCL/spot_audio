@@ -419,7 +419,7 @@ class MicrophoneLifecycleNode(Node):
 
         # initialize a speech object
         speech = ObservationDataSource()
-        speech.data_source_id = unique_id
+        speech.data_source_id = random.randint(-2**31, 2**31 - 1)
         speech.raw_audio = raw_speech_audio.tolist()  #amplified_filtered_audio.tolist()
         speech.platform_name = spot_name
         speech.audio_start = self.first_heard_speech_stamp.to_msg()
