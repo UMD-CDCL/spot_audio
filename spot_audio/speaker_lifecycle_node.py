@@ -137,7 +137,7 @@ class SpeakerNode(Node):
         stop_listening_request = StopListening.Request()
         right_now = self.get_clock().now()
         stop_listening_request.stop_listen_time = right_now.to_msg()
-        stop_listening_request.start_listen_time = (right_now + Duration(seconds=duration_s + 0.2)).to_msg()
+        stop_listening_request.start_listen_time = (right_now + Duration(seconds=duration_s + 0.3)).to_msg()
         #stop_listening_request.start_listen_time = (right_now + Duration(seconds=duration_s -0.5)).to_msg()
         self.stop_listening_client_.call_async(stop_listening_request)  # we don't even care about the result, so don't even wait for it.
 

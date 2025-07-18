@@ -95,6 +95,10 @@ class MicrophoneLifecycleNode(Node):
         # declare the whisper model
         self.transcriber = None
 
+        # to know whether we are assessing and should process audio
+        self.sub_spot_status = self.create_subscription(SpotStatus, 'spot_status', self.spot_status_callback, qos_profile_sensor_data)
+        self.assessing = False
+
         # configure
         self._declare_parameters()
         self._create_publishers()
@@ -157,6 +161,9 @@ class MicrophoneLifecycleNode(Node):
         self.microphone.start_stream()
         self.get_logger().info(f"Started microphone stream.")
         self.get_logger().info(f"Node \"{self.get_name()}\" transitioned to \"activate\".")
+
+    def spot_status_callback(self, msg: SpotStatus):
+        self.assessing = msg.state == SpotStatus.ASSESSING
 
     def _reset_audio_data(self):
         self.audio_buffer = []
@@ -270,6 +277,13 @@ class MicrophoneLifecycleNode(Node):
             first_time_stamp = self.first_time_stamp_
         buffered_audio = self.audio_buffer
         self.audio_buffer = []
+
+        if not self.assessing:
+            # clear all speech buffers
+            self.speech_buffer = None
+            self.last_heard_speech_stamp = None
+            self.first_heard_speech_stamp = None
+            return
 
         # if the buffer is empty, just return
         if len(buffered_audio) == 0:
