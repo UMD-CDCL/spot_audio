@@ -4,8 +4,10 @@ import numpy as np
 import numpy.typing as npt
 import os
 import torch
+from torch import Tensor
 from transformers import ASTConfig, AutoFeatureExtractor, ASTForAudioClassification
-from typing import Optional, Tuple, Dict
+import torch.nn.functional as F
+from typing import Optional, Tuple, Dict, List
 
 
 def pcm16_to_tensor(data_i16: npt.NDArray) -> torch.Tensor:
@@ -20,6 +22,30 @@ def pcm16_to_tensor(data_i16: npt.NDArray) -> torch.Tensor:
     mean = torch.mean(tensor)
     std = torch.std(tensor)
     return (tensor - mean) / (2 * std)
+
+
+def respiratory_distress_labels() -> Dict[int, List[int]]:
+    num_audio_set_labels = 527
+    audio_set_labels = set([ii for ii in range(num_audio_set_labels)])
+    respiratory_distress = set([22, 24, 25] + [ii for ii in range(38, 51)])
+    no_respiratory_distress = audio_set_labels - respiratory_distress
+    return {
+        0: list(no_respiratory_distress),
+        1: list(respiratory_distress)
+    }
+
+
+def verbal_alertness_labels() -> Dict[int, List[int]]:
+    num_audio_set_labels = 527
+    audio_set_labels = set([ii for ii in range(num_audio_set_labels)])
+    normal_labels = set([ii for ii in range(0, 8)] + [ii for ii in range(27, 37)] + [68])
+    abnormal_labels = set([ii for ii in range(8, 27)] + [ii for ii in range(37, 50)])
+    absent_labels =  (audio_set_labels - normal_labels) - abnormal_labels
+    return {
+        0: list(normal_labels),
+        1: list(abnormal_labels),
+        2: list(absent_labels)
+    }
 
 
 def audio_set_label_to_respiratory_distress_label(audio_set_label_id: int) -> Optional[int]:
@@ -72,27 +98,65 @@ class AudioClassificationStrategy(ABC):
 class MaxArgStrategy(AudioClassificationStrategy):
     def __init__(self, path_to_classifier: str, logger):
         super().__init__(path_to_classifier, logger)
+        self.respiratory_distress_labels = respiratory_distress_labels()
+        self.verbal_alertness_labels = verbal_alertness_labels()
 
-    def apply_strategy(self, output_tensor: Optional[torch.Tensor]) -> dict[str, int | None] | None:
+    def apply_strategy(self, output_tensor: Optional[torch.Tensor]) -> tuple[Tensor, Tensor] | None:
         if self.classifier_model is not None and output_tensor is not None:
             # use the model to predict the audio set class
             with torch.no_grad():
                 logits = self.classifier_model(output_tensor).logits
 
-            # determine the max label
-            predicted_audio_set_label_id = torch.argmax(logits, dim=-1).item()
+            # convert logits to probabilities using softmax
+            probs = F.softmax(logits, dim=1)
+            # self.logger.info(f'logits shape: {probs.shape}')
+            # self.logger.info(f'respiratory_distress_labels: {self.respiratory_distress_labels}')
+            # self.logger.info(f'respiratory distress regular: {probs[0,self.respiratory_distress_labels[0]]}')
+            # self.logger.info(f'respiratory distress regular: {probs[0,self.respiratory_distress_labels[1]]}')
 
-            # determine the name of the label the model predicted
-            predicted_audio_set_label = self.classifier_model.config.id2label[predicted_audio_set_label_id]
+            device = logits.device  # Preserve device (CPU or CUDA)
+            def aggregate(dict_):
+                keys = sorted(dict_.keys())
+                return torch.stack([
+                    probs[0, torch.tensor(dict_[k], device=device)].sum()
+                    for k in keys
+                ])
 
-            # convert the AudioSet label to a casualty report label
-            predicted_verbal_alertness_label = audio_set_label_to_verbal_alertness_label(predicted_audio_set_label_id)
-            predicted_respiratory_distress_label = audio_set_label_to_respiratory_distress_label(predicted_audio_set_label_id)
+            return aggregate(self.respiratory_distress_labels), aggregate(self.verbal_alertness_labels)
 
-            self.logger.info(f"Predicted AudioSet label: {predicted_audio_set_label}")
+            # # Build vectors of summed probabilities in order of keys
+            # respiratory_distress_keys = sorted(self.respiratory_distress_labels.keys())
+            # verbal_alertness_keys = sorted(self.verbal_alertness_labels.keys())
+            #
+            # respiratory_distress_probs = torch.tensor([probs[self.respiratory_distress_labels[k]].sum().item() for k in respiratory_distress_keys], device=device)
+            # verbal_alertness_probs = torch.tensor([probs[self.verbal_alertness_labels[k]].sum().item() for k in verbal_alertness_keys], device=device)
+            #
+            # return respiratory_distress_probs, verbal_alertness_probs
 
-            # return the casualty report id
-            return {"alertness_verbal": predicted_verbal_alertness_label, "respiratory_distress": predicted_respiratory_distress_label}
+            # def aggregate_probs(group_dict):
+            #     return {
+            #         key: float(torch.sum(probs[torch.tensor(indices)]))
+            #         for key, indices in group_dict.items()
+            #     }
+            #
+            # respiratory_distress_output = aggregate_probs(self.respiratory_distress_labels)
+            # verbal_alertness_output = aggregate_probs(self.verbal_alertness_labels)
+            # return respiratory_distress_output, verbal_alertness_output
+
+            # # determine the max label
+            # predicted_audio_set_label_id = torch.argmax(logits, dim=-1).item()
+            #
+            # # determine the name of the label the model predicted
+            # predicted_audio_set_label = self.classifier_model.config.id2label[predicted_audio_set_label_id]
+            #
+            # # convert the AudioSet label to a casualty report label
+            # predicted_verbal_alertness_label = audio_set_label_to_verbal_alertness_label(predicted_audio_set_label_id)
+            # predicted_respiratory_distress_label = audio_set_label_to_respiratory_distress_label(predicted_audio_set_label_id)
+            #
+            # self.logger.info(f"Predicted AudioSet label: {predicted_audio_set_label}")
+            #
+            # # return the casualty report id
+            # return {"alertness_verbal": predicted_verbal_alertness_label, "respiratory_distress": predicted_respiratory_distress_label}
         return None
 
 

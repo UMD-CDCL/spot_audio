@@ -2,7 +2,7 @@
 
 
 from audio_common_msgs.msg import AudioData
-from cdcl_umd_msgs.msg import Observation, ObserverModule, Speech
+from cdcl_umd_msgs.msg import Observation, ObservationModule, ObservationDataSource, SpotStatus
 from cdcl_umd_msgs.srv import StopListening
 import diagnostic_updater
 import diagnostic_msgs
@@ -18,10 +18,16 @@ import random
 import rclpy
 from rclpy.duration import Duration
 from rclpy.lifecycle import Node, State, TransitionCallbackReturn, LifecycleState
+from rclpy.qos import qos_profile_sensor_data
+import sys
 from scipy.signal import resample
 from threading import Lock
+import time
+import torch
 import uuid
 
+import os
+spot_name = os.environ['SPOT_NAME']
 
 
 
@@ -89,87 +95,15 @@ class MicrophoneLifecycleNode(Node):
         # declare the whisper model
         self.transcriber = None
 
-    def produce_diagnostics(self, stat):
-        # define nominal diagnostic status
-        status = diagnostic_msgs.msg.DiagnosticStatus.STALE
-        summary_msg = 'System inactive.'
+        # to know whether we are assessing and should process audio
+        self.sub_spot_status = self.create_subscription(SpotStatus, 'spot_status', self.spot_status_callback, qos_profile_sensor_data)
+        self.assessing = False
 
-        # the state of the node
-        state_label = self._state_machine.current_state[1]
-        stat.add('state', f'{state_label}')
-
-        # if we re-entered "unconfigured" state, that usually indicates a crash occurred.
-        if state_label == 'unconfigured' and not self.initial_unconfigured_state:
-            status = diagnostic_msgs.msg.DiagnosticStatus.WARN
-            summary_msg = 'Re-entered unconfigured state. This tends to indicate that something caused a crash.'
-        if state_label == 'active':
-            status = diagnostic_msgs.msg.DiagnosticStatus.OK
-            summary_msg = 'All systems active'
-
-        # check if microphone loaded
-        if self.microphone is None:
-            # if we are in "active" state but microphone isn't loaded, that's a problem.
-            if state_label == 'active':
-                status = diagnostic_msgs.msg.DiagnosticStatus.ERROR
-                summary_msg = 'Microphone not loaded, but we are supposed to be \"active\"'
-            stat.add('connected_to_microphone', 'false')
-        else:
-            stat.add('connected_to_microphone', 'true')
-
-        # check if whisper loaded
-        if self.transcriber is None:
-            if state_label == 'active':
-                status = diagnostic_msgs.msg.DiagnosticStatus.ERROR
-                summary_msg = 'Whisper not loaded, but we are supposed to be \"active\"'
-            stat.add('whisper_loaded', 'false')
-        else:
-            stat.add('whisper_loaded', 'true')
-
-        # check if AST loaded
-        if self.audio_classification_strategy is None:
-            if state_label == 'active':
-                status = diagnostic_msgs.msg.DiagnosticStatus.ERROR
-                summary_msg = 'Audio classifier not loaded, but we are supposed to be \"active\"'
-            stat.add('audio_classifier_loaded', 'false')
-        else:
-            stat.add('audio_classifier_loaded', 'true')
-
-        stat.summary(status, summary_msg)
-        return stat
-
-    def on_configure(self, state: State) -> TransitionCallbackReturn:
-        """
-        According to nav2 documentation (https://docs.nav2.org/concepts/index.html#lifecycle-nodes-and-bond) setup all
-        parameters and ROS networking interfaces
-        :param state:
-        :return: whether we successfully finished the function
-        """
-        self.get_logger().info(f"Node \"{self.get_name()}\" is in state \"{state.label}\". Transitioning to \"configure\".")
-        self.initial_unconfigured_state = False
+        # configure
         self._declare_parameters()
         self._create_publishers()
         self._create_timers()
         self._create_services()
-        return TransitionCallbackReturn.SUCCESS
-
-    def on_cleanup(self, state: LifecycleState) -> TransitionCallbackReturn:
-        """
-        should do the "reverse" of the "on_configure" function; see https://design.ros2.org/articles/node_lifecycle.html
-        :param state: the state we are leaving
-        :return: whether we successfully finished the function
-        """
-        self.get_logger().info(f"Node \"{self.get_name()}\" is in state \"{state.label}\". Transitioning to \"configure\".")
-        self._on_cleanup()
-        return TransitionCallbackReturn.SUCCESS
-
-    def _on_cleanup(self):
-        self._undeclare_parameters()
-        self._destroy_publishers()
-        self._destroy_timers()
-        self._destroy_services()
-
-    def on_activate(self, state: State) -> TransitionCallbackReturn:
-        self.get_logger().info(f"Node \"{self.get_name()}\" is in state \"{state.label}\". Transitioning to \"activate\".")
 
         # reset the main buffer so we don't process audio from previous time this node ran
         self._reset_audio_data()
@@ -182,10 +116,10 @@ class MicrophoneLifecycleNode(Node):
         self.microphone = MicrophoneDevice(self.on_received_audio, self.get_logger(), self.get_parameter('microphone_sampling_freq_hz').value)
         self.microphone.create_pyaudio()
         if not self.microphone.find_device(self.get_parameter('microphone_name').value):
-            self.get_logger().error("Failed to find audio device with matching name. Not transitioning to \"active\".")
-            self.stop_listening_start_time = None
-            self.stop_listening_stop_time = None
-            return TransitionCallbackReturn.FAILURE
+            self.get_logger().fatal("Failed to find audio device with matching name.")
+            while True:
+                time.sleep(1)
+
         self.get_logger().info(f"Found microphone at device index \"{self.microphone.device_index}\". Creating stream.")
 
         # try loading classifier model, if we fail, then return FAILURE, otherwise continue
@@ -195,7 +129,11 @@ class MicrophoneLifecycleNode(Node):
             self.stop_listening_start_time = None
             self.stop_listening_stop_time = None
             self.microphone.destroy_pyaudio()
-            return TransitionCallbackReturn.FAILURE
+            # loop indefinitely
+            while True:
+                time.sleep(1)
+
+
 
         # try loading whisper model, if we fail, then return FAILURE, otherwise continue
         self.vad_parameters = {
@@ -222,56 +160,13 @@ class MicrophoneLifecycleNode(Node):
         self.get_logger().info(f"Created microphone stream.")
         self.microphone.start_stream()
         self.get_logger().info(f"Started microphone stream.")
-        return TransitionCallbackReturn.SUCCESS
+        self.get_logger().info(f"Node \"{self.get_name()}\" transitioned to \"activate\".")
 
-    def on_deactivate(self, state: State) -> TransitionCallbackReturn:
-        self.get_logger().info(f"Node \"{self.get_name()}\" is in state \"{state.label}\". Transitioning to \"deactivate\".")
-        self._on_deactivate()
-        return TransitionCallbackReturn.SUCCESS
-
-    def _on_deactivate(self):
-        if self.microphone is not None:
-            self.microphone.stop_stream()
-            self.get_logger().info(f"Microphone stream stopped.")
-            self.microphone.destroy_stream()
-            self.get_logger().info(f"Microphone stream destroyed.")
-            self.microphone.destroy_pyaudio()
-            self.get_logger().info(f"Pyaudio destroyed.")
-            self.microphone = None
-            self.audio_classification_strategy = None
-            self.vad_parameters = None
-            self.transcriber = None
-            self.audio_prefetch_bytes = None
-            self.audio_prefetch_buffer = None
-            self.stop_listening_start_time = None
-            self.stop_listening_stop_time = None
+    def spot_status_callback(self, msg: SpotStatus):
+        self.assessing = msg.state == SpotStatus.ASSESSING
 
     def _reset_audio_data(self):
         self.audio_buffer = []
-
-    def on_error(self, state: LifecycleState) -> TransitionCallbackReturn:
-        """
-        if we go to on_error, then we are returning to on_configure, so deactivate (if possibly) and cleanup (if
-        possible)
-        :param state: the state we are coming frome
-        :return:
-        """
-        self.get_logger().error(f"An error occurred in MicrophoneLifeCycleNode.")
-        self._on_deactivate()
-        self._on_cleanup()
-        return TransitionCallbackReturn.SUCCESS
-
-
-    def on_shutdown(self, state: State) -> TransitionCallbackReturn:
-        """
-        you can go to finalized from any state, so make sure we deactivate and cleanup before exiting
-        :param state:
-        :return:
-        """
-        self.get_logger().info(f"Node \"{self.get_name()}\" is in state \"{state.label}\". Transitioning to \"shutdown\".")
-        self._on_deactivate()
-        self._on_cleanup()
-        return TransitionCallbackReturn.SUCCESS
 
     def _declare_parameters(self) -> None:
         self.get_logger().info("Declaring node parameters.")
@@ -316,7 +211,8 @@ class MicrophoneLifecycleNode(Node):
 
         # publisher for publishing raw audio heard by the microphone
         self.pub_raw_audio = self.create_publisher(AudioData, 'raw_audio', 10)
-        self.pub_speech = self.create_publisher(Speech, 'speech', 10)
+        self.pub_speech = self.create_publisher(ObservationDataSource, 'speech', 10)
+        self.pub_observation_data_source = self.create_publisher(ObservationDataSource, 'observation_data_sources', 10)
         self.pub_observation = self.create_publisher(Observation, 'observation_no_id', 10)
 
         self.get_logger().info("Created publishers..")
@@ -382,6 +278,13 @@ class MicrophoneLifecycleNode(Node):
         buffered_audio = self.audio_buffer
         self.audio_buffer = []
 
+        if not self.assessing:
+            # clear all speech buffers
+            self.speech_buffer = None
+            self.last_heard_speech_stamp = None
+            self.first_heard_speech_stamp = None
+            return
+
         # if the buffer is empty, just return
         if len(buffered_audio) == 0:
             return
@@ -398,7 +301,7 @@ class MicrophoneLifecycleNode(Node):
             assert len(self.pre_speech_buffer) == 3
 
         # filter and amplify the audio
-        # raw_audio = np.hstack(buffered_audio).astype(np.int16)
+        raw_audio = np.hstack(buffered_audio).astype(np.int8)
         # amplified_filtered_audio = raw_audio
         amplified_filtered_audio = self.filter_audio(np.hstack([elem for l in self.pre_speech_buffer for elem in l]))
 
@@ -413,32 +316,53 @@ class MicrophoneLifecycleNode(Node):
             audio_resampled = resample(amplified_filtered_audio_f32, num_samples_resampled)
             amplified_filtered_audio = np.clip(np.round(audio_resampled), -32768, 32767).astype(np.int16)
         output_tensor = self.audio_classification_strategy.classify_audio(amplified_filtered_audio)
-        predicted_labels = self.audio_classification_strategy.apply_strategy(output_tensor)
-        if predicted_labels is not None:
-            self.get_logger().debug(f"Predicted Labels: {predicted_labels}")
+        output = self.audio_classification_strategy.apply_strategy(output_tensor)
+        if output is not None:
+            respiratory_distress_outputs, verbal_alertness_outputs = output
+            respiratory_distress_label = torch.argmax(respiratory_distress_outputs).item()
+            verbal_alertness_label = torch.argmax(verbal_alertness_outputs).item()
+            # respiratory_distress_label = max(respiratory_distress_outputs.items(), key=lambda item: item[1])[0]
+            # verbal_alertness_label = max(verbal_alertness_outputs.items(), key=lambda item: item[1])[0]
+            self.get_logger().info(f"Respiratory Distress: {respiratory_distress_outputs}, Verbal Alertness: {verbal_alertness_outputs}")
 
             # publish the verbal alertness classification, if it's non-verbal vocalization and we didn't send last time
+            already_sent_observation_data_source = False
+            observation_data_source = ObservationDataSource(
+                data_source_id=unique_id,
+                platform_name=spot_name,
+                raw_audio=raw_audio
+            )
             if not self.sent_non_verbal_last_time:
-                if predicted_labels['alertness_verbal'] == 1 or predicted_labels['alertness_verbal'] == 0:
+                if verbal_alertness_label == 1 or verbal_alertness_label == 0:
                     alertness_observation = Observation()
-                    alertness_observation.unique_id = unique_id
+                    alertness_observation.platform_name = spot_name #self.get_parameter('robot_name').value
+                    alertness_observation.data_source_id = unique_id
                     alertness_observation.stamp = first_time_stamp.to_msg()
-                    alertness_observation.observer_module = ObserverModule.VIT_VERBAL_ALERTNESS
-                    alertness_observation.observation = [float(predicted_labels['alertness_verbal'])]
+                    alertness_observation.observation_module = ObservationModule.AST_ALERTNESS_VERBAL
+                    alertness_observation.observation = respiratory_distress_outputs.tolist()
                     self.pub_observation.publish(alertness_observation)
                     self.sent_non_verbal_last_time = True
                     self.get_logger().debug("Detected a non-verbal vocalization. Publishing observation message.")
 
+                    already_sent_observation_data_source = True
+                    self.pub_observation_data_source.publish(observation_data_source)
+
+
                 # publish the respiratory distress classification, if it's non-verbal vocalization
-                if predicted_labels['respiratory_distress'] == 1:
+                if respiratory_distress_label == 1:
                     alertness_observation = Observation()
-                    alertness_observation.unique_id = unique_id
+                    alertness_observation.platform_name = spot_name  #self.get_parameter('robot_name').value
+                    alertness_observation.data_source_id = unique_id
                     alertness_observation.stamp = first_time_stamp.to_msg()
-                    alertness_observation.observer_module = ObserverModule.VIT_RESPIRATORY_DISTRESS
-                    alertness_observation.observation = [float(predicted_labels['respiratory_distress'])]
+                    alertness_observation.observation_module = ObservationModule.AST_RESPIRATORY_DISTRESS
+                    alertness_observation.observation = respiratory_distress_outputs.tolist()
                     self.pub_observation.publish(alertness_observation)
                     self.sent_non_verbal_last_time = True
                     self.get_logger().debug("Detected a respiratory distress. Publishing observation message.")
+
+                    if not already_sent_observation_data_source:
+                        self.pub_observation_data_source.publish(observation_data_source)
+
             else:
                 self.sent_non_verbal_last_time = False
 
@@ -446,7 +370,7 @@ class MicrophoneLifecycleNode(Node):
         transcript = self._transcribe_speech(amplified_filtered_audio)
 
         # if there was an error transcribing the speech, add the audio to the speech buffer out of an abundance of caution (maybe there is actually speech there)
-        if transcript is None or predicted_labels is None:
+        if transcript is None or output is None:
             self.get_logger().warn("Transcription of latest speech buffer failed. Appending data to speech buffer anyway.")
             if self.speech_buffer is None:
                 self.speech_buffer = self.pre_speech_buffer
@@ -458,7 +382,7 @@ class MicrophoneLifecycleNode(Node):
         self.get_logger().debug(f"Transcribed initial speech with no errors. Probability of Speech: {transcript['prob_speech']}.")
 
         # speech was detected
-        if predicted_labels['alertness_verbal'] == 0 and transcript['prob_speech'] >= 0.50:  # tweak these numbers?
+        if verbal_alertness_label == 0 and transcript['prob_speech'] >= 0.50:  # tweak these numbers?
             self.get_logger().debug(f"Received what is most likely speech. Appending audio to speech buffer.")
             self.last_heard_speech_stamp = self.get_clock().now()
             if self.speech_buffer is None:
@@ -480,8 +404,9 @@ class MicrophoneLifecycleNode(Node):
                 return
 
         time_stopped_listening = self.get_clock().now()
-        # amplified_filtered_audio = self.filter_audio(np.hstack([elem for l in self.speech_buffer_ for elem in l]))
-        amplified_filtered_audio = np.hstack([elem for l in self.speech_buffer for elem in l])
+        raw_speech_audio = np.hstack(buffered_audio).astype(np.int8)
+        amplified_filtered_audio = self.filter_audio(np.hstack([elem for l in self.speech_buffer for elem in l]))
+        # amplified_filtered_audio = np.hstack([elem for l in self.speech_buffer for elem in l])
 
         # classify the whole speech buffer
         target_sample_rate = 16000
@@ -491,38 +416,48 @@ class MicrophoneLifecycleNode(Node):
             audio_resampled = resample(amplified_filtered_audio_f32, num_samples_resampled)
             amplified_filtered_audio = np.clip(np.round(audio_resampled), -32768, 32767).astype(np.int16)
         output_tensor = self.audio_classification_strategy.classify_audio(amplified_filtered_audio)
-        predicted_labels = self.audio_classification_strategy.apply_strategy(output_tensor)
+        output = self.audio_classification_strategy.apply_strategy(output_tensor)
 
         transcript = self._transcribe_speech(amplified_filtered_audio)
-        if transcript is None or predicted_labels is None:
+        if transcript is None or output is None:
             self.get_logger().warn(f"While trying to transcribe the speech buffer, an error occurred, so we missed out on speech. Clearing buffers.")
             self.speech_buffer = None
             self.last_heard_speech_stamp = None
             self.first_heard_speech_stamp = None
             return
 
+        respiratory_distress_outputs, verbal_alertness_outputs = output
+        respiratory_distress_label = torch.argmax(respiratory_distress_outputs).item()
+        verbal_alertness_label = torch.argmax(verbal_alertness_outputs).item()
+        self.get_logger().info(f"Respiratory Distress: {respiratory_distress_outputs}, Verbal Alertness: {verbal_alertness_outputs}")
+
         # initialize a speech object
-        speech = Speech()
-        speech.unique_id = unique_id
-        speech.raw_audio = amplified_filtered_audio.tolist()
-        speech.start_time = self.first_heard_speech_stamp.to_msg()
-        speech.end_time = self.last_heard_speech_stamp.to_msg()
+        speech = ObservationDataSource()
+        speech.data_source_id = random.randint(-2**31, 2**31 - 1)
+        speech.raw_audio = raw_speech_audio.tolist()  #amplified_filtered_audio.tolist()
+        speech.platform_name = spot_name
+        speech.audio_start = self.first_heard_speech_stamp.to_msg()
+        speech.audio_end_time = self.last_heard_speech_stamp.to_msg()
+
 
         # publish the transcription of the entire speech buffer.
-        if predicted_labels['alertness_verbal'] == 0 and transcript['prob_speech'] >= 0.60:
+        if verbal_alertness_label == 0 and transcript['prob_speech'] >= 0.60:
             now = self.get_clock().now()
             self.get_logger().info(f"Detected Speech Transcription: {transcript}. Processing delay: {now - time_stopped_listening}. Stop Listening Delay: {now - self.last_heard_speech_stamp}. Publishing observations and clearing the buffers.")
 
             # publish speech
-            speech.transcript = transcript['transcript']
+            speech.audio_transcript = transcript['transcript']
+            speech.audio_transcript = transcript['transcript']
             self.pub_speech.publish(speech)
+            self.pub_observation_data_source.publish(speech)
 
             # publish an observation corresponding to speech
             alertness_observation = Observation()
-            alertness_observation.unique_id = unique_id
+            alertness_observation.platform_name = spot_name  #self.get_parameter('robot_name').value
+            alertness_observation.data_source_id = unique_id
             alertness_observation.stamp = self.first_heard_speech_stamp.to_msg()
-            alertness_observation.observer_module = ObserverModule.WHISPER_VERBAL_ALERTNESS
-            alertness_observation.observation = [0.0]
+            alertness_observation.observation_module = ObservationModule.WHISPER_ALERTNESS_VERBAL
+            alertness_observation.observation = [transcript['prob_speech'], 0.0, 1.0 - transcript['prob_speech']]  # todo, this is a speech classifier, so it detects presence or absence of NORMAL.
             self.pub_observation.publish(alertness_observation)
 
 
@@ -599,9 +534,6 @@ class MicrophoneLifecycleNode(Node):
 def main(args=None) -> None:
     rclpy.init(args=args)
     microphone_node = MicrophoneLifecycleNode('microphone_lifecycle_node')
-    updater = diagnostic_updater.Updater(microphone_node)
-    updater.setHardwareID('microphone')
-    updater.add('diagnostics', microphone_node.produce_diagnostics)
     rclpy.spin(microphone_node)
     rclpy.shutdown()
 
