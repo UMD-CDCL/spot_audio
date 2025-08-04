@@ -109,9 +109,9 @@ class MaxArgStrategy(AudioClassificationStrategy):
 
             # convert logits to probabilities using softmax
             probs = F.softmax(logits, dim=1)
-            # self.logger.info(f'logits shape: {probs.shape}')
-            # self.logger.info(f'respiratory_distress_labels: {self.respiratory_distress_labels}')
-            # self.logger.info(f'respiratory distress regular: {probs[0,self.respiratory_distress_labels[0]]}')
+            self.logger.info(f'logits shape: {probs.shape}')
+            #self.logger.info(f'respiratory_distress_labels: {self.respiratory_distress_labels}')
+            #self.logger.info(f'respiratory distress regular: {probs[0,self.respiratory_distress_labels[0]]}')
             # self.logger.info(f'respiratory distress regular: {probs[0,self.respiratory_distress_labels[1]]}')
 
             device = logits.device  # Preserve device (CPU or CUDA)
@@ -122,6 +122,7 @@ class MaxArgStrategy(AudioClassificationStrategy):
                     for k in keys
                 ])
 
+            self.logger.info(f"aggregate = {aggregate(self.verbal_alertness_labels)}")
             return aggregate(self.respiratory_distress_labels), aggregate(self.verbal_alertness_labels)
 
             # # Build vectors of summed probabilities in order of keys
