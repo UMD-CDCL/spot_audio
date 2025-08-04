@@ -339,7 +339,7 @@ class MicrophoneLifecycleNode(Node):
                     alertness_observation.data_source_id = unique_id
                     alertness_observation.stamp = first_time_stamp.to_msg()
                     alertness_observation.observation_module = ObservationModule.AST_ALERTNESS_VERBAL
-                    alertness_observation.observation = respiratory_distress_outputs.tolist()
+                    alertness_observation.observation = verbal_alertness_outputs.tolist()
                     self.pub_observation.publish(alertness_observation)
                     self.sent_non_verbal_last_time = True
                     self.get_logger().debug("Detected a non-verbal vocalization. Publishing observation message.")
@@ -458,7 +458,7 @@ class MicrophoneLifecycleNode(Node):
             alertness_observation.stamp = self.first_heard_speech_stamp.to_msg()
             alertness_observation.observation_module = ObservationModule.WHISPER_ALERTNESS_VERBAL
             alertness_observation.observation = [transcript['prob_speech'], 0.0, 1.0 - transcript['prob_speech']]  # todo, this is a speech classifier, so it detects presence or absence of NORMAL.
-            self.pub_observation.publish(alertness_observation)
+            # self.pub_observation.publish(alertness_observation)
 
 
         # clearing the buffers
