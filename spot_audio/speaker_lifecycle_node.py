@@ -133,7 +133,15 @@ class SpeakerNode(Node):
 
         # ask the microphone to stop listening for the next <duration of wavfile> seconds
         duration_s = self._compute_wavfile_duration(self.xtts_output_file_.value)
+
+        # try to recreate the audio, if it's empty
+        if duration_s == 0.0:
+            self.get_logger().error(f'Generated empty audio file during transcription!')
+            self._run_tts(request.text.lower())
+            duration_s = self._compute_wavfile_duration(self.xtts_output_file_.value)
+
         self.get_logger().info(f"Audio Duration: {duration_s} [s]")
+
         stop_listening_request = StopListening.Request()
         right_now = self.get_clock().now()
         stop_listening_request.stop_listen_time = right_now.to_msg()
