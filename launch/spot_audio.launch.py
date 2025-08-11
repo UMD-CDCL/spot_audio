@@ -17,11 +17,11 @@ def generate_launch_description():
             name='microphone_lifecycle_node',
             output='log',
         ),
-        Node(
-            package='spot_audio',
-            namespace=spot_name,
-            executable='speaker_lifecycle_node.py',
-            name='speaker_lifecycle_node',
-            output='log'
-        )
+        # Node(
+        #     package='spot_audio',
+        #     namespace=spot_name,
+        #     executable='speaker_lifecycle_node.py',
+        #     name='speaker_lifecycle_node',
+        #     output='log'
+        # )
     ])

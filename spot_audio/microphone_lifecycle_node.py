@@ -300,6 +300,8 @@ class MicrophoneLifecycleNode(Node):
             self.get_logger().debug("Appending audio to pre-speech buffer.")
             assert len(self.pre_speech_buffer) == 3
 
+        self.get_logger().info(f'Reaching this point')
+
         # filter and amplify the audio
         raw_audio = np.hstack(buffered_audio).astype(np.int8)
         # amplified_filtered_audio = raw_audio

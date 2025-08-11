@@ -40,6 +40,11 @@ install(
 )
 
 install(
+        PROGRAMS ${PROJECT_NAME}/audio_classification_node.py
+        DESTINATION lib/${PROJECT_NAME}
+)
+
+install(
     DIRECTORY ${PROJECT_NAME}/microphone
     DESTINATION lib/${PROJECT_NAME}
 )
