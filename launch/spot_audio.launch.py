@@ -17,6 +17,13 @@ def generate_launch_description():
             name='microphone_lifecycle_node',
             output='log',
         ),
+        Node(
+            package='spot_audio',
+            namespace=spot_name,
+            executable='audio_classification_node.py',
+            name='audio_classification_node',
+            output='log',
+        ),
         # Node(
         #     package='spot_audio',
         #     namespace=spot_name,

@@ -477,28 +477,31 @@ class MicrophoneLifecycleNode(Node):
         """
         if channel == self.get_parameter('main_channel').value:
             # immediately publish all unprocessed audio --- might contain spot speech but that's good!
-            self.pub_raw_audio.publish(AudioData(data=data.astype(np.uint8)))
+            arr_int16 = np.array(data, dtype=np.int16)
+            # self.get_logger().info(f'data = {data}')
+            self.pub_raw_audio.publish(AudioData(data=arr_int16.view(np.uint8).tolist()))
+            # self.pub_raw_audio.publish(AudioData(data=data.astype(np.uint8)))
 
             # compute duration of audio segment we just received
             seconds_ago = len(data) / (self.microphone.rate * self.microphone.bitdepth / 8.0)
 
-            # ignore and flush the audio buffer if we received audio during period that we were playing sound
-            if self.stop_listening_start_time <= self.get_clock().now() <= self.stop_listening_stop_time:
-                self.audio_buffer = []
-                self.get_logger().info("Ignoring audio")
-                return
-
-            # update the first and last times we received audio data
-            if len(self.audio_buffer) == 0:
-                with self.time_stamp_mutex_:
-                    self.first_time_stamp_ = self.get_clock().now() - Duration(seconds=seconds_ago)
-                    self.last_time_stamp_ = self.get_clock().now()
-            else:
-                with self.time_stamp_mutex_:
-                    self.last_time_stamp_ = self.get_clock().now()
-
-            # append the most recent data onto the end of the buffer
-            self.audio_buffer.append(data)
+            # # ignore and flush the audio buffer if we received audio during period that we were playing sound
+            # if self.stop_listening_start_time <= self.get_clock().now() <= self.stop_listening_stop_time:
+            #     self.audio_buffer = []
+            #     self.get_logger().info("Ignoring audio")
+            #     return
+            #
+            # # update the first and last times we received audio data
+            # if len(self.audio_buffer) == 0:
+            #     with self.time_stamp_mutex_:
+            #         self.first_time_stamp_ = self.get_clock().now() - Duration(seconds=seconds_ago)
+            #         self.last_time_stamp_ = self.get_clock().now()
+            # else:
+            #     with self.time_stamp_mutex_:
+            #         self.last_time_stamp_ = self.get_clock().now()
+            #
+            # # append the most recent data onto the end of the buffer
+            # self.audio_buffer.append(data)
 
     def stop_listening_callback(self, request, response):
         """
