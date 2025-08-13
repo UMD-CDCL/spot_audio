@@ -107,13 +107,11 @@ class MaxArgStrategy(AudioClassificationStrategy):
             with torch.no_grad():
                 logits = self.classifier_model(output_tensor).logits
 
+            predicted_audio_set_label_id = torch.argmax(logits, dim=-1).item()
+            predicted_audio_set_label = self.classifier_model.config.id2label[predicted_audio_set_label_id]
+            self.logger.debug(f"Predicted Audio Set Label: {predicted_audio_set_label}")
             # convert logits to probabilities using softmax
             probs = F.softmax(logits, dim=1)
-            self.logger.info(f'logits shape: {probs.shape}')
-            #self.logger.info(f'respiratory_distress_labels: {self.respiratory_distress_labels}')
-            #self.logger.info(f'respiratory distress regular: {probs[0,self.respiratory_distress_labels[0]]}')
-            # self.logger.info(f'respiratory distress regular: {probs[0,self.respiratory_distress_labels[1]]}')
-
             device = logits.device  # Preserve device (CPU or CUDA)
             def aggregate(dict_):
                 keys = sorted(dict_.keys())
@@ -121,8 +119,6 @@ class MaxArgStrategy(AudioClassificationStrategy):
                     probs[0, torch.tensor(dict_[k], device=device)].sum()
                     for k in keys
                 ])
-
-            self.logger.info(f"aggregate = {aggregate(self.verbal_alertness_labels)}")
             return aggregate(self.respiratory_distress_labels), aggregate(self.verbal_alertness_labels)
 
             # # Build vectors of summed probabilities in order of keys
