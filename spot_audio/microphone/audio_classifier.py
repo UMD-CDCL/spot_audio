@@ -74,10 +74,13 @@ class AudioClassificationStrategy(ABC):
     def classify_audio(self, audio_data: npt.NDArray) -> Optional[torch.Tensor]:
         if self.classifier_feature_extractor is not None:
             # convert the PCM16 raw audio vector to a pytorch tensor conforming to requirements of input of model
-            audio_tensor = pcm16_to_tensor(audio_data)
+            # audio_tensor = pcm16_to_tensor(audio_data)
 
             # preprocess the audio
-            inputs = self.classifier_feature_extractor(audio_tensor, sampling_rate=16000.0, return_tensors="pt")
+            # inputs = self.classifier_feature_extractor(audio_tensor, sampling_rate=16000.0, return_tensors="pt")
+            audio_tensor = torch.from_numpy(audio_data.astype(np.float32) / 32768.0)
+            inputs = self.classifier_feature_extractor(audio_tensor.numpy(), sampling_rate=16000, return_tensors="pt")
+            # self.logger.info(f'Max length: {self.classifier_feature_extractor.max_length}, Sample Rate: {self.classifier_feature_extractor.sampling_rate}')
             tensor = inputs['input_values'].to(self.device)
             return tensor
         return None

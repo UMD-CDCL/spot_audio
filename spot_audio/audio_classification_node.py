@@ -16,6 +16,7 @@ from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
 from scipy.signal import resample_poly
+from std_msgs.msg import Empty
 import time
 import torch
 from typing import Optional
@@ -86,7 +87,7 @@ class AudioClassificationNode(Node):
             self.transcription_timer_period_s,
             self.transcription_timer_callback
         )
-        self.transcription_to_classification_period = 5  # classify 5x as frequently as we transcribe
+        self.transcription_to_classification_period = 2  # classify 5x as frequently as we transcribe
         self.classification_timer = self.create_timer(
             self.transcription_timer_period_s / self.transcription_to_classification_period,
             self.classification_timer_callback
@@ -95,6 +96,21 @@ class AudioClassificationNode(Node):
         # only process audio while we are assessing
         self.sub_spot_status = self.create_subscription(SpotStatus, 'spot_status', self.spot_status_callback, qos_profile_sensor_data)
         self.assessing = False
+
+        # heart beat stuff
+        self.pub_heartbeat = self.create_publisher(
+            Empty,
+            'audio_classification/heartbeat',
+            10
+        )
+        self.heartbeat_timer = self.create_timer(2.5, self.heartbeat_callback)
+
+    def heartbeat_callback(self) -> None:
+        """
+        sends a heartbeat message so the spot status publisher knows if whisper + AST are working
+        :return: nothing
+        """
+        self.pub_heartbeat.publish(Empty())
 
     @staticmethod
     def amplify_audio(buffered_audio: np.ndarray, gain: float=1.0) -> np.ndarray:
@@ -212,7 +228,10 @@ class AudioClassificationNode(Node):
             # classify the audio (classify 1 second chunks)
             start = time.time()
             chunks = np.array_split(self.rolling_buffer, self.transcription_to_classification_period)
-            classification_tensor = self.audio_classification_strategy.classify_audio(chunks[-1])
+            classification_tensor = self.audio_classification_strategy.classify_audio(
+                chunks[-1]
+                # AudioClassificationNode.pcm_to_f32(chunks[-1])
+            )
             classifications = self.audio_classification_strategy.apply_strategy(classification_tensor)
 
             # if we got a valid output, then publish observation + observation data source messages

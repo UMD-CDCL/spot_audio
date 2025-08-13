@@ -1,5 +1,5 @@
 from launch import LaunchDescription
-from launch_ros.actions import LifecycleNode, Node
+from launch_ros.actions import Node
 import os
 
 # get the home directory
@@ -10,11 +10,11 @@ spot_name = os.environ['SPOT_NAME']
 
 def generate_launch_description():
     return LaunchDescription([
-        LifecycleNode(
+        Node(
             package='spot_audio',
             namespace=spot_name,
-            executable='microphone_lifecycle_node.py',
-            name='microphone_lifecycle_node',
+            executable='microphone_node.py',
+            name='microphone_node',
             output='log',
         ),
         Node(
@@ -27,8 +27,8 @@ def generate_launch_description():
         Node(
             package='spot_audio',
             namespace=spot_name,
-            executable='speaker_lifecycle_node.py',
-            name='speaker_lifecycle_node',
+            executable='speaker_node.py',
+            name='speaker_node',
             output='log'
         )
     ])
