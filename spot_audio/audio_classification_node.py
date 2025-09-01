@@ -246,7 +246,7 @@ class AudioClassificationNode(Node):
                     platform_name=spot_name
                 )
                 published_observation = False
-                if (verbal_alertness_label == 1 or verbal_alertness_label == 0) and not torch.isnan(respiratory_distress_classification).any().item():
+                if (verbal_alertness_label == 1 or verbal_alertness_label == 0) and not torch.isnan(verbal_alertness_classification).any().item():
                     alertness_verbal_observation = Observation(
                         stamp=self.get_clock().now().to_msg(),
                         platform_name=spot_name,
