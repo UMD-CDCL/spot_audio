@@ -35,21 +35,23 @@ ament_python_install_package(${PROJECT_NAME})
 
 # install the Python executables
 install(
-    PROGRAMS ${PROJECT_NAME}/microphone_lifecycle_node.py
+    PROGRAMS ${PROJECT_NAME}/microphone_node.py
     DESTINATION lib/${PROJECT_NAME}
 )
+install(
+        PROGRAMS ${PROJECT_NAME}/audio_classification_node.py
+        DESTINATION lib/${PROJECT_NAME}
+)
+install(
+        PROGRAMS ${PROJECT_NAME}/speaker_node.py
+        DESTINATION lib/${PROJECT_NAME}
+)
 
+# install libraries
 install(
     DIRECTORY ${PROJECT_NAME}/microphone
     DESTINATION lib/${PROJECT_NAME}
 )
-
-# install the Python executables
-install(
-    PROGRAMS ${PROJECT_NAME}/speaker_lifecycle_node.py
-    DESTINATION lib/${PROJECT_NAME}
-)
-
 install(
     DIRECTORY ${PROJECT_NAME}/speaker
     DESTINATION lib/${PROJECT_NAME}
