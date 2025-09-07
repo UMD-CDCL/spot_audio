@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 
+from audio_common_msgs.msg import AudioData, AudioDataStamped
 from cdcl_umd_msgs.srv import PlaySound
 from cdcl_umd_msgs.srv import StopListening
 from std_msgs.msg import Empty
@@ -10,6 +11,7 @@ from rclpy.node import Node
 from rclpy.duration import Duration
 import torch
 from speaker.speaker_device import USBSpeakerDevice, JackSpeakerDevice
+from std_msgs.msg import Header
 from TTS.tts.configs.xtts_config import XttsConfig
 from TTS.tts.models.xtts import Xtts
 import torchaudio
@@ -44,6 +46,11 @@ class SpeakerNode(Node):
             'speaker/heartbeat',
             10
         )
+        self.spot_voice_ = self.create_publisher(
+            AudioDataStamped,
+            'speaker/voice',
+            10
+        )
         self.heartbeat_timer_ = self.create_timer(2.5, self.heartbeat_callback)
 
         # initialize the speaker device
@@ -67,6 +74,7 @@ class SpeakerNode(Node):
         self._run_tts('Hello world! This is a test!')
         self._run_tts('I try to generate at least three sounds first')
         self._run_tts('Spot is ready to go!')
+        self.seq = 0
         # self.speaker_device_.play_sound(self.xtts_output_file_.value)
 
     def heartbeat_callback(self) -> None:
@@ -139,6 +147,11 @@ class SpeakerNode(Node):
             self.get_logger().error(f'Generated empty audio file during transcription!')
             self._run_tts(request.text.lower())
             duration_s = self._compute_wavfile_duration(self.xtts_output_file_.value)
+        # try to recreate the audio, if it's empty
+        if duration_s == 0.0:
+            self.get_logger().error(f'Generated empty audio file during transcription!')
+            self._run_tts(request.text.lower())
+            duration_s = self._compute_wavfile_duration(self.xtts_output_file_.value)
 
         self.get_logger().info(f"Audio Duration: {duration_s} [s]")
 
@@ -154,9 +167,32 @@ class SpeakerNode(Node):
         self.speaker_device_.play_sound(self.xtts_output_file_.value)
         response.end_time = self.get_clock().now().to_msg()
 
+        self.spot_voice_.publish(
+            AudioDataStamped(
+                audio=SpeakerNode.wav_to_audio_data(self.xtts_output_file_.value),
+                header=Header(
+                    seq=self.seq,
+                    stamp=response.start_time
+                )
+            )
+        )
+        self.seq += 1
+
         # once the speaker stops playing the sound, report success to the user
         response.success = True
         return response
+
+    @staticmethod
+    def wav_to_audio_data(path: str) -> AudioData:
+        """
+        reads a .wav file and returns an AudioData message containing the raw audio
+        :param path: path to the .wav file
+        :return: AudioData: ROS message containing raw audio data
+        """
+        with wave.open(path, 'rb') as wav_file:
+            raw_bytes = wav_file.readframes(wav_file.getnframes())
+        return AudioData(data=bytearray(raw_bytes))
+
 
 
 def main(args=None):
