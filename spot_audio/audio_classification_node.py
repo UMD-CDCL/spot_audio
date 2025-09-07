@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 
-from audio_common_msgs.msg import AudioData
+from audio_common_msgs.msg import AudioData, AudioDataStamped
 from cdcl_umd_msgs.msg import Observation, ObservationModule, ObservationDataSource, SpotStatus
 from cdcl_umd_msgs.srv import StopListening
 from faster_whisper import WhisperModel
@@ -33,7 +33,7 @@ class AudioClassificationNode(Node):
         # the microphone parameters and microphone raw data
         self.declare_parameter('microphone_rate', 48000)
         self.sub_audio_data = self.create_subscription(
-            AudioData,
+            AudioDataStamped,
             '/' + spot_name + '/raw_audio',
             self.audio_data_callback,
             10
@@ -345,7 +345,7 @@ class AudioClassificationNode(Node):
         return raw_data.astype(np.float32) / max_amplitude
 
 
-    def audio_data_callback(self, msg: AudioData) -> None:
+    def audio_data_callback(self, msg: AudioDataStamped) -> None:
         """
         resamples audio to be 16000 Hz, amplifies and filters audio, then appends clean audio to either the noise buffer
         or a rolling buffer used for assessment
@@ -353,7 +353,7 @@ class AudioClassificationNode(Node):
         :return: nothing
         """
 
-        buffered_audio_u8 = np.array(msg.data, dtype=np.uint8)
+        buffered_audio_u8 = np.array(msg.audio.data, dtype=np.uint8)
         buffered_audio_16 = buffered_audio_u8.view(np.int16)
         buffered_audio_16 = AudioClassificationNode.resample_int16(buffered_audio_16, self.get_parameter('microphone_rate').value, 16000)
         amplified_buffered_audio_16 = AudioClassificationNode.amplify_audio(buffered_audio_16, 1.4)

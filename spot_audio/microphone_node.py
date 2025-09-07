@@ -9,11 +9,12 @@ transcription and classification.
 """
 
 
-from audio_common_msgs.msg import AudioData
+from audio_common_msgs.msg import AudioData, AudioDataStamped
 from microphone.microphone_device import MicrophoneDevice
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from std_msgs.msg import Header
 import time
 
 
@@ -25,7 +26,7 @@ class MicrophoneNode(Node):
         self.declare_parameter('microphone_name', 'RØDE')
         self.declare_parameter('microphone_sampling_freq_hz', 48000)  # 48000 for rode and 16000 for respeaker
         self.declare_parameter('main_channel', 0)
-        self.pub_raw_audio = self.create_publisher(AudioData, 'raw_audio', 10)
+        self.pub_raw_audio = self.create_publisher(AudioDataStamped, 'raw_audio', 10)
 
         # create a microphone device
         self.microphone = MicrophoneDevice(
@@ -34,6 +35,7 @@ class MicrophoneNode(Node):
             self.get_parameter('microphone_sampling_freq_hz').value
         )
         self.microphone.create_pyaudio()
+        self.seq = 0
 
         # wait in an infinite loop (rather than crashing the node) if we cannot connect to device
         if not self.microphone.find_device(self.get_parameter('microphone_name').value):
@@ -61,7 +63,18 @@ class MicrophoneNode(Node):
         if channel == self.get_parameter('main_channel').value:
             # RØDE microphone publishes PCM 16 format audio data and AudioData requires raw uint8 bytes, publish
             arr_int16 = np.array(data, dtype=np.int16)
-            self.pub_raw_audio.publish(AudioData(data=arr_int16.view(np.uint8).tolist()))
+            self.pub_raw_audio.publish(
+                AudioDataStamped(
+                    header=Header(
+                        seq=self.seq,
+                        stamp=self.get_clock().now().to_msg()
+                    ),
+                    audio=AudioData(
+                        data=arr_int16.view(np.uint8).tolist()
+                    )
+                )
+            )
+            self.seq += 1
 
 
 def main(args=None) -> None:
