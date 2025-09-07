@@ -74,10 +74,13 @@ class AudioClassificationStrategy(ABC):
     def classify_audio(self, audio_data: npt.NDArray) -> Optional[torch.Tensor]:
         if self.classifier_feature_extractor is not None:
             # convert the PCM16 raw audio vector to a pytorch tensor conforming to requirements of input of model
-            audio_tensor = pcm16_to_tensor(audio_data)
+            # audio_tensor = pcm16_to_tensor(audio_data)
 
             # preprocess the audio
-            inputs = self.classifier_feature_extractor(audio_tensor, sampling_rate=16000.0, return_tensors="pt")
+            # inputs = self.classifier_feature_extractor(audio_tensor, sampling_rate=16000.0, return_tensors="pt")
+            audio_tensor = torch.from_numpy(audio_data.astype(np.float32) / 32768.0)
+            inputs = self.classifier_feature_extractor(audio_tensor.numpy(), sampling_rate=16000, return_tensors="pt")
+            # self.logger.info(f'Max length: {self.classifier_feature_extractor.max_length}, Sample Rate: {self.classifier_feature_extractor.sampling_rate}')
             tensor = inputs['input_values'].to(self.device)
             return tensor
         return None
@@ -107,13 +110,11 @@ class MaxArgStrategy(AudioClassificationStrategy):
             with torch.no_grad():
                 logits = self.classifier_model(output_tensor).logits
 
+            predicted_audio_set_label_id = torch.argmax(logits, dim=-1).item()
+            predicted_audio_set_label = self.classifier_model.config.id2label[predicted_audio_set_label_id]
+            self.logger.debug(f"Predicted Audio Set Label: {predicted_audio_set_label}")
             # convert logits to probabilities using softmax
             probs = F.softmax(logits, dim=1)
-            self.logger.info(f'logits shape: {probs.shape}')
-            #self.logger.info(f'respiratory_distress_labels: {self.respiratory_distress_labels}')
-            #self.logger.info(f'respiratory distress regular: {probs[0,self.respiratory_distress_labels[0]]}')
-            # self.logger.info(f'respiratory distress regular: {probs[0,self.respiratory_distress_labels[1]]}')
-
             device = logits.device  # Preserve device (CPU or CUDA)
             def aggregate(dict_):
                 keys = sorted(dict_.keys())
@@ -121,8 +122,6 @@ class MaxArgStrategy(AudioClassificationStrategy):
                     probs[0, torch.tensor(dict_[k], device=device)].sum()
                     for k in keys
                 ])
-
-            self.logger.info(f"aggregate = {aggregate(self.verbal_alertness_labels)}")
             return aggregate(self.respiratory_distress_labels), aggregate(self.verbal_alertness_labels)
 
             # # Build vectors of summed probabilities in order of keys
