@@ -171,7 +171,6 @@ class SpeakerNode(Node):
             AudioDataStamped(
                 audio=SpeakerNode.wav_to_audio_data(self.xtts_output_file_.value),
                 header=Header(
-                    #seq=self.seq,
                     stamp=response.start_time
                 )
             )
