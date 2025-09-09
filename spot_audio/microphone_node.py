@@ -66,7 +66,7 @@ class MicrophoneNode(Node):
             self.pub_raw_audio.publish(
                 AudioDataStamped(
                     header=Header(
-                        seq=self.seq,
+                        #seq=self.seq,
                         stamp=self.get_clock().now().to_msg()
                     ),
                     audio=AudioData(
