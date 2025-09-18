@@ -14,6 +14,7 @@ from microphone.microphone_device import MicrophoneDevice
 import numpy as np
 import rclpy
 from rclpy.node import Node
+from rclpy.duration import Duration
 from std_msgs.msg import Header
 import time
 
@@ -36,6 +37,10 @@ class MicrophoneNode(Node):
         )
         self.microphone.create_pyaudio()
         self.seq = 0
+        self.last_got_audio_data = None
+
+        # watches to see if we haven't gotten data from device in a few seconds
+        self.timer = self.create_timer(3.0, self.timer_callback)  # watch
 
         # wait in an infinite loop (rather than crashing the node) if we cannot connect to device
         if not self.microphone.find_device(self.get_parameter('microphone_name').value):
@@ -52,6 +57,37 @@ class MicrophoneNode(Node):
             self.get_logger().fatal(f"Encountered error while creating/starting stream. Error was: {e}")
             while True:
                 time.sleep(5)
+
+    def timer_callback(self) -> None:
+        if self.last_got_audio_data is None:
+            return
+        
+        # try restarting stream, if we haven't heard from mic in awhile
+        if self.get_clock().now() - self.last_got_audio_data > Duration(seconds=5.0):
+            self._disconnect()
+            self._reconnect()
+    
+    def _disconnect(self) -> None:
+        try:
+            self.microphone.stop_stream()
+            self.microphone.destroy_stream()
+            self.microphone.destroy_pyaudio()
+        except Exception as e:
+            self.get_logger().fatal(f"Encountered error while disconnecting from microphone. Error was {e}.")
+
+    def _reconnect(self) -> None:
+        try:
+            self.microphone.create_pyaudio()
+            if not self.microphone.find_device(self.get_parameter('microphone_name').value):
+                return
+            self.microphone.create_stream()
+            self.microphone.start_stream()
+        except Exception as e:
+            self.get_logger().fatal(f"Encountered error while reconnecting to microphone. Error was {e}")
+        
+        
+
+
 
     def on_received_audio(self, data, channel) -> None:
         """
@@ -73,6 +109,7 @@ class MicrophoneNode(Node):
                     )
                 )
             )
+            self.last_got_audio_data = self.get_clock().now()
             self.seq += 1
 
 
