@@ -70,6 +70,10 @@ class SpeakerNode(Node):
         self.xtts_model_.cuda()
         self.get_logger().info(f"Loading XTTS Model.")
 
+        # save speaker embeddings
+        self.gpt_cond_latent, self.speaker_embedding = self.xtts_model_.get_conditioning_latents(audio_path=self.xtts_speaker_audio_file_.value, gpt_cond_len=self.xtts_model_.config.gpt_cond_len, max_ref_length=self.xtts_model_.config.max_ref_len, sound_norm_refs=self.xtts_model_.config.sound_norm_refs)
+
+
         # generate the first speech, just so the model is warmed up
         self._run_tts('Hello world! This is a test!')
         self._run_tts('I try to generate at least three sounds first')
@@ -89,12 +93,11 @@ class SpeakerNode(Node):
         """
 
         # perform the inference to generate the audio
-        gpt_cond_latent, speaker_embedding = self.xtts_model_.get_conditioning_latents(audio_path=self.xtts_speaker_audio_file_.value, gpt_cond_len=self.xtts_model_.config.gpt_cond_len, max_ref_length=self.xtts_model_.config.max_ref_len, sound_norm_refs=self.xtts_model_.config.sound_norm_refs)
         out = self.xtts_model_.inference(
             text=text,
             language='en',
-            gpt_cond_latent=gpt_cond_latent,
-            speaker_embedding=speaker_embedding,
+            gpt_cond_latent=self.gpt_cond_latent,
+            speaker_embedding=self.speaker_embedding,
             temperature=self.xtts_model_.config.temperature,
             length_penalty=self.xtts_model_.config.length_penalty,
             repetition_penalty=self.xtts_model_.config.repetition_penalty,
