@@ -10,7 +10,7 @@ transcription and classification.
 
 
 from audio_common_msgs.msg import AudioData, AudioDataStamped
-from microphone.microphone_device import MicrophoneDevice
+from microphone.udp_microphone_device import UdpMicrophoneDevice
 import numpy as np
 import rclpy
 from rclpy.node import Node
@@ -24,35 +24,29 @@ class MicrophoneNode(Node):
         super().__init__(node_name, allow_undeclared_parameters=True, automatically_declare_parameters_from_overrides=True)
 
         # declare microphone parameters
-        self.declare_parameter('microphone_name', 'RØDE')
+        self.declare_parameter('microphone_udp_port', 21885)
         self.declare_parameter('microphone_sampling_freq_hz', 48000)  # 48000 for rode and 16000 for respeaker
         self.declare_parameter('main_channel', 0)
         self.pub_raw_audio = self.create_publisher(AudioDataStamped, 'raw_audio', 10)
 
         # create a microphone device
-        self.microphone = MicrophoneDevice(
+        self.microphone = UdpMicrophoneDevice(
             self.on_received_audio,
             self.get_logger(),
-            self.get_parameter('microphone_sampling_freq_hz').value
+            self.get_parameter('microphone_sampling_freq_hz').value,
+            self.get_parameter('microphone_udp_port').value
         )
-        self.microphone.create_pyaudio()
+
         self.seq = 0
         self.last_got_audio_data = None
 
         # watches to see if we haven't gotten data from device in a few seconds
         self.timer = self.create_timer(3.0, self.timer_callback)  # watch
 
-        # wait in an infinite loop (rather than crashing the node) if we cannot connect to device
-        if not self.microphone.find_device(self.get_parameter('microphone_name').value):
-            self.get_logger().fatal("Failed to find audio device with matching name.")
-            while True:
-                time.sleep(5)
-
         # start streaming audio data immediately
         try:
-            self.microphone.create_stream()
             self.microphone.start_stream()
-            self.get_logger().info(f"Successfully streaming audio from {self.get_parameter('microphone_name').value} mic!")
+            self.get_logger().info(f"Started streaming audio from RODE mic!")
         except Exception as e:
             self.get_logger().fatal(f"Encountered error while creating/starting stream. Error was: {e}")
             while True:
@@ -70,17 +64,11 @@ class MicrophoneNode(Node):
     def _disconnect(self) -> None:
         try:
             self.microphone.stop_stream()
-            self.microphone.destroy_stream()
-            self.microphone.destroy_pyaudio()
         except Exception as e:
             self.get_logger().fatal(f"Encountered error while disconnecting from microphone. Error was {e}.")
 
     def _reconnect(self) -> None:
         try:
-            self.microphone.create_pyaudio()
-            if not self.microphone.find_device(self.get_parameter('microphone_name').value):
-                return
-            self.microphone.create_stream()
             self.microphone.start_stream()
         except Exception as e:
             self.get_logger().fatal(f"Encountered error while reconnecting to microphone. Error was {e}")
