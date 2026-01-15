@@ -40,7 +40,7 @@ class MicrophoneNode(Node):
         self.last_got_audio_data = None
 
         # watches to see if we haven't gotten data from device in a few seconds
-        self.timer = self.create_timer(3.0, self.timer_callback)  # watch
+        self.timer = self.create_timer(1.5, self.timer_callback)  # watch
 
         # wait in an infinite loop (rather than crashing the node) if we cannot connect to device
         if not self.microphone.find_device(self.get_parameter('microphone_name').value):
@@ -63,7 +63,7 @@ class MicrophoneNode(Node):
             return
         
         # try restarting stream, if we haven't heard from mic in awhile
-        if self.get_clock().now() - self.last_got_audio_data > Duration(seconds=5.0):
+        if self.get_clock().now() - self.last_got_audio_data > Duration(seconds=1.0):
             self._disconnect()
             self._reconnect()
     

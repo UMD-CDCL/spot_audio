@@ -254,8 +254,9 @@ class AudioClassificationNode(Node):
                         observation_module = ObservationModule.AST_ALERTNESS_VERBAL,
                         observation=verbal_alertness_classification.tolist()
                     )
-                    self.pub_observation.publish(alertness_verbal_observation)
-                    published_observation = True
+                    if alertness_verbal_observation.observation[0] >= 0.6:
+                        self.pub_observation.publish(alertness_verbal_observation)
+                        published_observation = True
                 if respiratory_distress_label == 1 and  not torch.isnan(respiratory_distress_classification).any().item():
                     respiratory_distress_observation = Observation(
                         stamp=self.get_clock().now().to_msg(),
