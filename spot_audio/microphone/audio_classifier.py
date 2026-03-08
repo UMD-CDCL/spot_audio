@@ -30,7 +30,8 @@ def respiratory_distress_labels() -> Dict[int, List[int]]:
     respiratory_distress = set([22, 24, 25] + [ii for ii in range(38, 51)])
     no_respiratory_distress = audio_set_labels - respiratory_distress
     return {
-        0: list(no_respiratory_distress),
+        # 0: list(no_respiratory_distress),
+        0: [],
         1: list(respiratory_distress)
     }
 
@@ -43,8 +44,10 @@ def verbal_alertness_labels() -> Dict[int, List[int]]:
     absent_labels =  (audio_set_labels - normal_labels) - abnormal_labels
     return {
         0: list(normal_labels),
-        1: list(abnormal_labels),
-        2: list(absent_labels)
+        1: []
+        # 1: list(abnormal_labels),
+        # 2: list(absent_labels)
+        # 2:[]
     }
 
 
@@ -103,26 +106,126 @@ class MaxArgStrategy(AudioClassificationStrategy):
         super().__init__(path_to_classifier, logger)
         self.respiratory_distress_labels = respiratory_distress_labels()
         self.verbal_alertness_labels = verbal_alertness_labels()
+    
 
+    # def apply_strategy(self, output_tensor: Optional[torch.Tensor]) -> tuple[Tensor, Tensor] | None:
+    #     if self.classifier_model is None or output_tensor is None:
+    #         return None
+
+    #     with torch.no_grad():
+    #         logits = self.classifier_model(output_tensor).logits  # shape: (1, C)
+
+    #     predicted_audio_set_label_id = torch.argmax(logits, dim=-1).item()
+    #     predicted_audio_set_label = self.classifier_model.config.id2label[predicted_audio_set_label_id]
+    #     self.logger.info(f"Predicted Audio Set Label: {predicted_audio_set_label}")
+
+    #     device = logits.device
+    #     k = 9
+    #     logits0 = logits[0]  # shape: (C,)
+
+    #     def aggregate_topk(dict_):
+    #         keys = sorted(dict_.keys())
+    #         group_scores = []
+
+    #         for k_group in keys:
+    #             idx = torch.tensor(dict_[k_group], device=device)
+    #             group_logits = logits0[idx]
+
+    #             # handle small groups safely
+    #             k_eff = min(k, group_logits.numel())
+
+    #             topk_vals = torch.topk(group_logits, k_eff).values
+    #             score = topk_vals.mean()   # aggregate score for this group
+    #             group_scores.append(score)
+
+    #         group_scores = torch.stack(group_scores)  # shape: (num_groups,)
+    #         group_probs = torch.softmax(group_scores, dim=0)
+    #         return group_probs
+
+    #     return (
+    #         aggregate_topk(self.respiratory_distress_labels),
+    #         aggregate_topk(self.verbal_alertness_labels),
+    #     )
     def apply_strategy(self, output_tensor: Optional[torch.Tensor]) -> tuple[Tensor, Tensor] | None:
-        if self.classifier_model is not None and output_tensor is not None:
-            # use the model to predict the audio set class
-            with torch.no_grad():
-                logits = self.classifier_model(output_tensor).logits
+        if self.classifier_model is None or output_tensor is None:
+            return None
 
-            predicted_audio_set_label_id = torch.argmax(logits, dim=-1).item()
-            predicted_audio_set_label = self.classifier_model.config.id2label[predicted_audio_set_label_id]
-            self.logger.debug(f"Predicted Audio Set Label: {predicted_audio_set_label}")
-            # convert logits to probabilities using softmax
-            probs = F.softmax(logits, dim=1)
-            device = logits.device  # Preserve device (CPU or CUDA)
-            def aggregate(dict_):
-                keys = sorted(dict_.keys())
-                return torch.stack([
-                    probs[0, torch.tensor(dict_[k], device=device)].sum()
-                    for k in keys
-                ])
-            return aggregate(self.respiratory_distress_labels), aggregate(self.verbal_alertness_labels)
+        with torch.no_grad():
+            logits = self.classifier_model(output_tensor).logits  # shape: (1, C)
+
+        predicted_audio_set_label_id = torch.argmax(logits, dim=-1).item()
+        predicted_audio_set_label = self.classifier_model.config.id2label[predicted_audio_set_label_id]
+        self.logger.debug(f"Predicted Audio Set Label: {predicted_audio_set_label}")
+
+        # Use sigmoid for multi-label probabilities (independent)
+        probs = torch.sigmoid(logits)  # shape: (1, C)
+        device = logits.device
+        eps = 1e-12
+
+        def aggregate_and_fix_empty(dict_):
+            keys = sorted(dict_.keys())
+            group_sums = []
+
+            # 1) compute sums for each group safely (handle empty lists)
+            empty_key_indices = []
+            for i, k in enumerate(keys):
+                idx_list = dict_[k]
+                if not idx_list:
+                    # record empty group index; push placeholder 0.0
+                    empty_key_indices.append(k)
+                    group_sums.append(torch.tensor(0.0, device=device))
+                else:
+                    idx = torch.tensor(idx_list, device=device, dtype=torch.long)
+                    group_sums.append(probs[0, idx].sum())
+
+            group_sums = torch.stack(group_sums)  # shape: (num_groups,)
+
+            # 2) compute absent mass = 1 - sum(non-absent groups)
+            # non_empty_sum is the sum of current group_sums (which has zeros for empty groups)
+            non_empty_sum = group_sums.sum()
+            absent_mass = (1.0 - non_empty_sum).clamp(min=0.0)
+
+            # 3) place absent_mass into empty group(s)
+            if len(empty_key_indices) == 1:
+                group_sums[empty_key_indices[0]] = absent_mass
+            elif len(empty_key_indices) > 1:
+                # split evenly if more than one empty group (unlikely but safe)
+                per_group = absent_mass / float(len(empty_key_indices))
+                for idx in empty_key_indices:
+                    group_sums[idx] = per_group
+            else:
+                # no empty groups found — nothing to set; leave group_sums as-is
+                # (we will normalize below so the vector becomes a distribution)
+                pass
+
+            # 4) final normalization (numerical safety)
+            group_probs = group_sums / (group_sums.sum() + eps)
+            return group_probs
+
+        return (
+            aggregate_and_fix_empty(self.respiratory_distress_labels),
+            aggregate_and_fix_empty(self.verbal_alertness_labels),
+        )
+
+    # def apply_strategy(self, output_tensor: Optional[torch.Tensor]) -> tuple[Tensor, Tensor] | None:
+    #     if self.classifier_model is not None and output_tensor is not None:
+    #         # use the model to predict the audio set class
+    #         with torch.no_grad():
+    #             logits = self.classifier_model(output_tensor).logits
+
+    #         predicted_audio_set_label_id = torch.argmax(logits, dim=-1).item()
+    #         predicted_audio_set_label = self.classifier_model.config.id2label[predicted_audio_set_label_id]
+    #         self.logger.debug(f"Predicted Audio Set Label: {predicted_audio_set_label}")
+    #         # convert logits to probabilities using softmax
+
+    #         device = logits.device  # Preserve device (CPU or CUDA)
+    #         def aggregate(dict_):
+    #             keys = sorted(dict_.keys())
+    #             return torch.stack([
+    #                 probs[0, torch.tensor(dict_[k], device=device)].sum()
+    #                 for k in keys
+    #             ])
+    #         return aggregate(self.respiratory_distress_labels), aggregate(self.verbal_alertness_labels)
 
             # # Build vectors of summed probabilities in order of keys
             # respiratory_distress_keys = sorted(self.respiratory_distress_labels.keys())
