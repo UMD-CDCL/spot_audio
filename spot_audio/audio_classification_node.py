@@ -87,7 +87,7 @@ class AudioClassificationNode(Node):
             self.transcription_timer_period_s,
             self.transcription_timer_callback
         )
-        self.transcription_to_classification_period = 2  # classify 5x as frequently as we transcribe
+        self.transcription_to_classification_period = 4  # classify 5x as frequently as we transcribe
         self.classification_timer = self.create_timer(
             self.transcription_timer_period_s / self.transcription_to_classification_period,
             self.classification_timer_callback
@@ -246,7 +246,7 @@ class AudioClassificationNode(Node):
                     platform_name=spot_name
                 )
                 published_observation = False
-                if (verbal_alertness_label == 1 or verbal_alertness_label == 0) and not torch.isnan(verbal_alertness_classification).any().item():
+                if not torch.isnan(verbal_alertness_classification).any().item():
                     alertness_verbal_observation = Observation(
                         stamp=self.get_clock().now().to_msg(),
                         platform_name=spot_name,
@@ -254,10 +254,10 @@ class AudioClassificationNode(Node):
                         observation_module = ObservationModule.AST_ALERTNESS_VERBAL,
                         observation=verbal_alertness_classification.tolist()
                     )
-                    if alertness_verbal_observation.observation[0] >= 0.6:
-                        self.pub_observation.publish(alertness_verbal_observation)
-                        published_observation = True
-                if respiratory_distress_label == 1 and  not torch.isnan(respiratory_distress_classification).any().item():
+                    # if alertness_verbal_observation.observation[0] >= 0.6:
+                    self.pub_observation.publish(alertness_verbal_observation)
+                    published_observation = True
+                if not torch.isnan(respiratory_distress_classification).any().item():
                     respiratory_distress_observation = Observation(
                         stamp=self.get_clock().now().to_msg(),
                         platform_name=spot_name,
