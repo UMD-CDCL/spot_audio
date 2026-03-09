@@ -167,6 +167,8 @@ class AudioClassificationNode(Node):
         :param rate: the rate at which the audio is sampled
         :return: nothing
         """
+        if buffered_audio is None:
+            return 0
         return len(buffered_audio) / rate
 
     def save_audio(self, buffered_audio: np.ndarray, path: str, file_name: str, rate: int) -> None:
@@ -215,7 +217,7 @@ class AudioClassificationNode(Node):
         :return: nothing
         """
         # only process audio when we are assessing
-        if not self.assessing:
+        if not self.assessing or self.noise_buffer is None or self.rolling_buffer is None:
             return
 
         noise_buffer_length_s = AudioClassificationNode.audio_length(self.noise_buffer, 16000.0)
