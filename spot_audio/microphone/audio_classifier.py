@@ -26,9 +26,10 @@ def pcm16_to_tensor(data_i16: npt.NDArray) -> torch.Tensor:
 
 def respiratory_distress_labels() -> Dict[int, List[int]]:
     num_audio_set_labels = 527
-    audio_set_labels = set([ii for ii in range(num_audio_set_labels)])
-    respiratory_distress = set([22, 24, 25] + [ii for ii in range(38, 51)])
-    no_respiratory_distress = audio_set_labels - respiratory_distress
+    # audio_set_labels = set([ii for ii in range(num_audio_set_labels)])
+    # respiratory_distress = set([22, 24, 25] + [ii for ii in range(38, 51)])
+    respiratory_distress = [43, 45, 46, 48, 49, 42]
+    # no_respiratory_distress = audio_set_labels - respiratory_distress
     return {
         # 0: list(no_respiratory_distress),
         0: [],
@@ -37,11 +38,11 @@ def respiratory_distress_labels() -> Dict[int, List[int]]:
 
 
 def verbal_alertness_labels() -> Dict[int, List[int]]:
-    num_audio_set_labels = 527
-    audio_set_labels = set([ii for ii in range(num_audio_set_labels)])
-    normal_labels = set([ii for ii in range(0, 8)] + [ii for ii in range(27, 37)] + [68])
-    abnormal_labels = set([ii for ii in range(8, 27)] + [ii for ii in range(37, 50)])
-    absent_labels =  (audio_set_labels - normal_labels) - abnormal_labels
+    # num_audio_set_labels = 527
+    # audio_set_labels = set([ii for ii in range(num_audio_set_labels)])
+    normal_labels = set([ii for ii in range(0, 8)] + [ii for ii in range(27, 37)])
+    # abnormal_labels = set([ii for ii in range(8, 27)] + [ii for ii in range(37, 50)])
+    # absent_labels =  (audio_set_labels - normal_labels) - abnormal_labels
     return {
         0: list(normal_labels),
         1: []
@@ -108,6 +109,87 @@ class MaxArgStrategy(AudioClassificationStrategy):
         self.verbal_alertness_labels = verbal_alertness_labels()
     
 
+    def apply_strategy(self, output_tensor: Optional[torch.Tensor]) -> tuple[Tensor, Tensor] | None:
+        if self.classifier_model is None or output_tensor is None:
+            return None
+
+        with torch.no_grad():
+            logits = self.classifier_model(output_tensor).logits  # shape: (1, C)
+
+        predicted_audio_set_label_id = torch.argmax(logits, dim=-1).item()
+        predicted_audio_set_label = self.classifier_model.config.id2label[predicted_audio_set_label_id]
+        self.logger.info(f"Predicted Audio Set Label: {predicted_audio_set_label}")
+
+        # multi-label semantics
+        probs = torch.softmax(logits, dim=1)  # shape: (1, C)
+        probs = torch.sigmoid(logits)  # shape: (1, C)
+        device = logits.device
+        eps = 1e-12
+
+        def aggregate_or_and_fill_empty(group_dict: dict) -> torch.Tensor:
+            """
+            For each group (keys sorted), compute P(any in group) = 1 - prod(1 - p_i).
+            If a group has an empty index list, remember its key position and later
+            fill it with the absent mass = prod(1 - p_all_non_empty).
+            Finally normalize the vector to sum to 1.
+            """
+            keys = sorted(group_dict.keys())
+            num_groups = len(keys)
+            group_vals = []
+            empty_positions = []
+
+            # Collect all non-empty indices (for computing absent mass)
+            all_non_empty_idx = []
+
+            for pos, k in enumerate(keys):
+                idx_list = group_dict[k]
+                if not idx_list:
+                    # empty group placeholder
+                    empty_positions.append(pos)
+                    group_vals.append(torch.tensor(0.0, device=device))
+                else:
+                    idx = torch.tensor(idx_list, device=device, dtype=torch.long)
+                    p_i = probs[0, idx]                # vector of probs for this group's labels
+                    # P(any) = 1 - prod(1 - p_i)
+                    prob_any = 1.0 - torch.prod(1.0 - p_i)
+                    # numerical clamp
+                    prob_any = prob_any.clamp(min=0.0, max=1.0)
+                    group_vals.append(prob_any)
+                    all_non_empty_idx.append(idx)
+
+            group_vals = torch.stack(group_vals)  # shape: (num_groups,)
+
+            # Compute absent mass = probability none of the non-empty labels are active
+            if all_non_empty_idx:
+                all_idx = torch.cat(all_non_empty_idx)
+                p_all = probs[0, all_idx]
+                prob_none_all = torch.prod(1.0 - p_all).clamp(min=0.0, max=1.0)
+            else:
+                # no non-empty groups: none-of-non-empty = 1 (everything is absent)
+                prob_none_all = torch.tensor(1.0, device=device)
+
+            # Place absent mass into empty group(s)
+            if len(empty_positions) == 1:
+                group_vals[empty_positions[0]] = prob_none_all
+            elif len(empty_positions) > 1:
+                per_group = (prob_none_all / float(len(empty_positions))).clamp(min=0.0, max=1.0)
+                for pos in empty_positions:
+                    group_vals[pos] = per_group
+            else:
+                # no empty groups: nothing to fill (we will normalize below)
+                pass
+
+            # Final normalization (make it sum-to-1 distribution, stable)
+            total = group_vals.sum()
+            group_probs = group_vals / (total + eps)
+
+            return group_probs
+
+        return (
+            aggregate_or_and_fill_empty(self.respiratory_distress_labels),
+            aggregate_or_and_fill_empty(self.verbal_alertness_labels),
+        )
+
     # def apply_strategy(self, output_tensor: Optional[torch.Tensor]) -> tuple[Tensor, Tensor] | None:
     #     if self.classifier_model is None or output_tensor is None:
     #         return None
@@ -120,7 +202,7 @@ class MaxArgStrategy(AudioClassificationStrategy):
     #     self.logger.info(f"Predicted Audio Set Label: {predicted_audio_set_label}")
 
     #     device = logits.device
-    #     k = 9
+    #     k = 1
     #     logits0 = logits[0]  # shape: (C,)
 
     #     def aggregate_topk(dict_):
@@ -146,66 +228,66 @@ class MaxArgStrategy(AudioClassificationStrategy):
     #         aggregate_topk(self.respiratory_distress_labels),
     #         aggregate_topk(self.verbal_alertness_labels),
     #     )
-    def apply_strategy(self, output_tensor: Optional[torch.Tensor]) -> tuple[Tensor, Tensor] | None:
-        if self.classifier_model is None or output_tensor is None:
-            return None
+    # def apply_strategy(self, output_tensor: Optional[torch.Tensor]) -> tuple[Tensor, Tensor] | None:
+    #     if self.classifier_model is None or output_tensor is None:
+    #         return None
 
-        with torch.no_grad():
-            logits = self.classifier_model(output_tensor).logits  # shape: (1, C)
+    #     with torch.no_grad():
+    #         logits = self.classifier_model(output_tensor).logits  # shape: (1, C)
 
-        predicted_audio_set_label_id = torch.argmax(logits, dim=-1).item()
-        predicted_audio_set_label = self.classifier_model.config.id2label[predicted_audio_set_label_id]
-        self.logger.debug(f"Predicted Audio Set Label: {predicted_audio_set_label}")
+    #     predicted_audio_set_label_id = torch.argmax(logits, dim=-1).item()
+    #     predicted_audio_set_label = self.classifier_model.config.id2label[predicted_audio_set_label_id]
+    #     self.logger.debug(f"Predicted Audio Set Label: {predicted_audio_set_label}")
 
-        # Use sigmoid for multi-label probabilities (independent)
-        probs = torch.sigmoid(logits)  # shape: (1, C)
-        device = logits.device
-        eps = 1e-12
+    #     # Use sigmoid for multi-label probabilities (independent)
+    #     probs = torch.sigmoid(logits)  # shape: (1, C)
+    #     device = logits.device
+    #     eps = 1e-12
 
-        def aggregate_and_fix_empty(dict_):
-            keys = sorted(dict_.keys())
-            group_sums = []
+    #     def aggregate_and_fix_empty(dict_):
+    #         keys = sorted(dict_.keys())
+    #         group_sums = []
 
-            # 1) compute sums for each group safely (handle empty lists)
-            empty_key_indices = []
-            for i, k in enumerate(keys):
-                idx_list = dict_[k]
-                if not idx_list:
-                    # record empty group index; push placeholder 0.0
-                    empty_key_indices.append(k)
-                    group_sums.append(torch.tensor(0.0, device=device))
-                else:
-                    idx = torch.tensor(idx_list, device=device, dtype=torch.long)
-                    group_sums.append(probs[0, idx].sum())
+    #         # 1) compute sums for each group safely (handle empty lists)
+    #         empty_key_indices = []
+    #         for i, k in enumerate(keys):
+    #             idx_list = dict_[k]
+    #             if not idx_list:
+    #                 # record empty group index; push placeholder 0.0
+    #                 empty_key_indices.append(k)
+    #                 group_sums.append(torch.tensor(0.0, device=device))
+    #             else:
+    #                 idx = torch.tensor(idx_list, device=device, dtype=torch.long)
+    #                 group_sums.append(probs[0, idx].sum())
 
-            group_sums = torch.stack(group_sums)  # shape: (num_groups,)
+    #         group_sums = torch.stack(group_sums)  # shape: (num_groups,)
 
-            # 2) compute absent mass = 1 - sum(non-absent groups)
-            # non_empty_sum is the sum of current group_sums (which has zeros for empty groups)
-            non_empty_sum = group_sums.sum()
-            absent_mass = (1.0 - non_empty_sum).clamp(min=0.0)
+    #         # 2) compute absent mass = 1 - sum(non-absent groups)
+    #         # non_empty_sum is the sum of current group_sums (which has zeros for empty groups)
+    #         non_empty_sum = group_sums.sum()
+    #         absent_mass = (1.0 - non_empty_sum).clamp(min=0.0)
 
-            # 3) place absent_mass into empty group(s)
-            if len(empty_key_indices) == 1:
-                group_sums[empty_key_indices[0]] = absent_mass
-            elif len(empty_key_indices) > 1:
-                # split evenly if more than one empty group (unlikely but safe)
-                per_group = absent_mass / float(len(empty_key_indices))
-                for idx in empty_key_indices:
-                    group_sums[idx] = per_group
-            else:
-                # no empty groups found — nothing to set; leave group_sums as-is
-                # (we will normalize below so the vector becomes a distribution)
-                pass
+    #         # 3) place absent_mass into empty group(s)
+    #         if len(empty_key_indices) == 1:
+    #             group_sums[empty_key_indices[0]] = absent_mass
+    #         elif len(empty_key_indices) > 1:
+    #             # split evenly if more than one empty group (unlikely but safe)
+    #             per_group = absent_mass / float(len(empty_key_indices))
+    #             for idx in empty_key_indices:
+    #                 group_sums[idx] = per_group
+    #         else:
+    #             # no empty groups found — nothing to set; leave group_sums as-is
+    #             # (we will normalize below so the vector becomes a distribution)
+    #             pass
 
-            # 4) final normalization (numerical safety)
-            group_probs = group_sums / (group_sums.sum() + eps)
-            return group_probs
+    #         # 4) final normalization (numerical safety)
+    #         group_probs = group_sums / (group_sums.sum() + eps)
+    #         return group_probs
 
-        return (
-            aggregate_and_fix_empty(self.respiratory_distress_labels),
-            aggregate_and_fix_empty(self.verbal_alertness_labels),
-        )
+    #     return (
+    #         aggregate_and_fix_empty(self.respiratory_distress_labels),
+    #         aggregate_and_fix_empty(self.verbal_alertness_labels),
+    #     )
 
     # def apply_strategy(self, output_tensor: Optional[torch.Tensor]) -> tuple[Tensor, Tensor] | None:
     #     if self.classifier_model is not None and output_tensor is not None:
