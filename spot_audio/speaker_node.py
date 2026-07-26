@@ -12,6 +12,9 @@ from rclpy.duration import Duration
 import torch
 from speaker.speaker_device import USBSpeakerDevice, JackSpeakerDevice
 from std_msgs.msg import Header
+
+# remember you have numba==0.60.0 installed to make this not crash with
+# ImportError: cannot import name 'magphase' from 'librosa' (/home/cdcl/.local/lib/python3.10/site-packages/librosa/__init__.py)
 from TTS.tts.configs.xtts_config import XttsConfig
 from TTS.tts.models.xtts import Xtts
 import torchaudio
