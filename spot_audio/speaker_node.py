@@ -54,12 +54,17 @@ class SpeakerNode(Node):
         self.get_logger().info(f"Loading Kokoro Model...")
         # 'a' = American English. Model weights will auto-download on first run.
         self.tts_pipeline_ = KPipeline(lang_code='a') 
-        self.kokoro_voice_ = 'am_adam'
+        self.kokoro_voice_ = 'af_sky'  # i prefer this one.
+        # self.kokoro_voice_ = 'af_aoede'  # i prefer this one.
+        # self.kokoro_voice_ = 'af_heart'  # af (american female), am (american male)
+        # self.kokoro_voice_ = 'af_alloy'  # af (american female), am (american male)
+        # self.kokoro_voice_ = 'af_sarah'  # af (american female), am (american male)
 
         # generate the first speech, just so the model is warmed up
         self._run_tts('Hello world! This is a test!')
         self._run_tts('I try to generate at least three sounds first')
         self._run_tts('Spot is ready to go!')
+        self._run_tts('Cairo ready!')
         self.seq = 0
 
     def heartbeat_callback(self) -> None:
