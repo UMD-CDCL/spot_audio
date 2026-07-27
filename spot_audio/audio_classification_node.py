@@ -61,7 +61,7 @@ class AudioClassificationNode(Node):
         self.transcriber = WhisperModel(
             self.get_parameter('path_to_whisper').value,
             device='cuda',
-            compute_type='int8',
+            compute_type='float16',
             local_files_only=False
         )
 
@@ -292,8 +292,8 @@ class AudioClassificationNode(Node):
         rolling_buffer_length_s = AudioClassificationNode.audio_length(self.rolling_buffer, 16000.0)
         noise_buffer_full = noise_buffer_length_s >= self.get_parameter('noise_buffer_length_s').value
         rolling_buffer_full = rolling_buffer_length_s >= self.get_parameter('rolling_window_period_s').value
+        self.get_logger().debug(f'Before processing, buffer length (s): {rolling_buffer_length_s}')
         if noise_buffer_full and rolling_buffer_full:
-            self.get_logger().debug(f'Before processing, buffer length (s): {rolling_buffer_length_s}')
 
             # save the audio file for debugging before transcription
             if self.get_parameter('save_audio').value:
@@ -310,7 +310,7 @@ class AudioClassificationNode(Node):
                 AudioClassificationNode.pcm_to_f32(self.rolling_buffer),
                 language='en',
                 task='transcribe',
-                temperature=0.1  # reducing => fewer hallucinations
+                temperature=0.05  # reducing => fewer hallucinations
             )
             stop = time.time()
             self.get_logger().debug(f'Took {stop - start:.2f} s to transcribe audio.')  # takes 0.05-0.07 seconds on HP

@@ -32,7 +32,7 @@ class MicrophoneNode(Node):
         self.pub_raw_audio = self.create_publisher(AudioDataStamped, 'raw_audio', 10)
 
         # for saving audio to .wav
-        self.save_debug_audio = True
+        self.save_debug_audio = False
         self.audio_buffer = bytearray()
         self.record_start_time = None
 
