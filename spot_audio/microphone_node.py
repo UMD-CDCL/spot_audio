@@ -29,10 +29,10 @@ class MicrophoneNode(Node):
         self.declare_parameter('microphone_udp_port', 21885)
         self.declare_parameter('microphone_sampling_freq_hz', 48000)  # 48000 for rode and 16000 for respeaker
         self.declare_parameter('main_channel', 0)
-        self.pub_raw_audio = self.create_publisher(AudioDataStamped, 'raw_audio', 10)
+        self.pub_raw_audio = self.create_publisher(AudioDataStamped, 'raw_audio', 50)
 
         # for saving audio to .wav
-        self.save_debug_audio = True
+        self.save_debug_audio = False
         self.audio_buffer = bytearray()
         self.record_start_time = None
 
