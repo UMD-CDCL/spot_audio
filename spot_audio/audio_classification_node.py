@@ -12,6 +12,9 @@ import numpy as np
 import os
 import random
 import rclpy
+from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.duration import Duration
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
@@ -30,13 +33,19 @@ class AudioClassificationNode(Node):
     def __init__(self, node_name: str):
         super().__init__(node_name, allow_undeclared_parameters=True, automatically_declare_parameters_from_overrides=True)
 
+        # separate callback groups so incoming audio keeps flowing while whisper/AST are busy decoding on
+        # the processing group; both use a MultiThreadedExecutor (see main())
+        self.audio_callback_group = MutuallyExclusiveCallbackGroup()
+        self.processing_callback_group = MutuallyExclusiveCallbackGroup()
+
         # the microphone parameters and microphone raw data
         self.declare_parameter('microphone_rate', 48000)
         self.sub_audio_data = self.create_subscription(
             AudioDataStamped,
             '/' + spot_name + '/raw_audio',
             self.audio_data_callback,
-            10
+            50,
+            callback_group=self.audio_callback_group
         )
 
         # noise buffer contains noise sample from environment
@@ -81,16 +90,29 @@ class AudioClassificationNode(Node):
         self.declare_parameter('path_to_saved_audio', '/home/cdcl/cdcl_ws/audio')
         self.declare_parameter('save_audio', False)
 
-        # how frequently to process the audio buffer
-        self.transcription_timer_period_s = 5.0
+        # how frequently to process the audio buffer. Ticking faster than the window length lets
+        # consecutive windows overlap, so a word cut at one window's trailing edge gets full context
+        # (and gets published) on a later tick instead of being lost/garbled at a hard 5s boundary.
+        self.transcription_timer_period_s = 1.5
         self.transcription_timer = self.create_timer(
             self.transcription_timer_period_s,
-            self.transcription_timer_callback
+            self.transcription_timer_callback,
+            callback_group=self.processing_callback_group
         )
-        self.transcription_to_classification_period = 4  # classify 5x as frequently as we transcribe
+        # segments already finalized up to this absolute time; segments before it are skipped as
+        # duplicates from a prior overlapping window, and segments within trailing_margin_s of "now"
+        # are skipped because they may still be revised once more context arrives on the next tick
+        self.published_until_time = None
+        self.trailing_margin_s = 1.0
+
+        self.classification_timer_period_s = 1.25
+        self.classification_chunks = max(1, round(
+            self.get_parameter('rolling_window_period_s').value / self.classification_timer_period_s
+        ))
         self.classification_timer = self.create_timer(
-            self.transcription_timer_period_s / self.transcription_to_classification_period,
-            self.classification_timer_callback
+            self.classification_timer_period_s,
+            self.classification_timer_callback,
+            callback_group=self.processing_callback_group
         )
 
         # only process audio while we are assessing
@@ -121,6 +143,9 @@ class AudioClassificationNode(Node):
         :return: amplified audio
         """
         peak = np.max(np.abs(buffered_audio))
+        if peak < 1:
+            # near/total silence: skip amplification instead of dividing by ~0 and blowing noise up to full scale
+            return buffered_audio
         gain = gain * float(2**15 - 1) / peak
         return np.clip(buffered_audio.astype(np.float32) * gain, -2**15, 2**15 - 1).astype(np.int16)
 
@@ -229,7 +254,7 @@ class AudioClassificationNode(Node):
 
             # classify the audio (classify 1 second chunks)
             start = time.time()
-            chunks = np.array_split(self.rolling_buffer, self.transcription_to_classification_period)
+            chunks = np.array_split(self.rolling_buffer, self.classification_chunks)
             classification_tensor = self.audio_classification_strategy.classify_audio(
                 chunks[-1]
                 # AudioClassificationNode.pcm_to_f32(chunks[-1])
@@ -280,7 +305,9 @@ class AudioClassificationNode(Node):
 
     def transcription_timer_callback(self) -> None:
         """
-        transcribes the audio buffer
+        transcribes the audio buffer, publishing only the newly-confirmed portion of each window so that
+        overlapping windows don't duplicate text and words on a window boundary get finalized once they
+        have full context
         :return: nothing
         """
         # only process audio when we are assessing
@@ -295,10 +322,24 @@ class AudioClassificationNode(Node):
         self.get_logger().debug(f'Before processing, buffer length (s): {rolling_buffer_length_s}')
         if noise_buffer_full and rolling_buffer_full:
 
+            window_duration = Duration(seconds=self.get_parameter('rolling_window_period_s').value)
+            now = self.get_clock().now()
+            if now.nanoseconds <= window_duration.nanoseconds:
+                # clock (e.g. sim time) hasn't advanced far enough yet to form a valid absolute window start
+                return
+            window_start_time = now - window_duration
+            if self.published_until_time is None:
+                self.published_until_time = window_start_time
+
+            # clean the audio once per window (instead of per ~30ms packet) so noise reduction has enough
+            # context to work with and the AGC doesn't repeatedly blow up background noise between packets
+            clean_window = AudioClassificationNode.filter_audio(self.rolling_buffer, 16000, noise_sample=self.noise_buffer)
+            clean_window = AudioClassificationNode.amplify_audio(clean_window, 1.4)
+
             # save the audio file for debugging before transcription
             if self.get_parameter('save_audio').value:
                 self.save_audio(
-                    self.rolling_buffer,
+                    clean_window,
                     self.get_parameter('path_to_saved_audio').value,
                     f'{self.seq}.wav',
                     16000
@@ -307,20 +348,28 @@ class AudioClassificationNode(Node):
             # transcribe the rolling buffer, timing how long it takes
             start = time.time()
             segments_gen, info = self.transcriber.transcribe(
-                AudioClassificationNode.pcm_to_f32(self.rolling_buffer),
+                AudioClassificationNode.pcm_to_f32(clean_window),
                 language='en',
                 task='transcribe',
-                temperature=0.05  # reducing => fewer hallucinations
+                vad_filter=True,  # suppress hallucinated text over silence/non-speech
+                condition_on_previous_text=False  # don't let one hallucinated segment bias the next
             )
             stop = time.time()
             self.get_logger().debug(f'Took {stop - start:.2f} s to transcribe audio.')  # takes 0.05-0.07 seconds on HP
 
-            # add speech we are confident in to "finalized speech buffer" for later publishing
+            # add speech we are confident in to "finalized speech buffer" for later publishing, skipping
+            # anything already published by a prior overlapping window or still too close to the live edge
+            live_edge_time = now - Duration(seconds=self.trailing_margin_s)
             for segment in segments_gen:
+                abs_start = window_start_time + Duration(seconds=segment.start)
+                abs_end = window_start_time + Duration(seconds=segment.end)
+                if abs_start < self.published_until_time or abs_end > live_edge_time:
+                    continue
                 prob_speech = 1.0 - segment.no_speech_prob
                 self.get_logger().debug(f"     [{segment.start:.2f} - {segment.end:.2f}] [{prob_speech:.3f}] {segment.text}")
                 if prob_speech > 0.7:
                     self.finalized_speech_buffer += segment.text
+                self.published_until_time = abs_end
 
             # Publish the audio we are confident in, then clear the speech buffer
             self.get_logger().debug(f'Speech: {self.finalized_speech_buffer}')
@@ -350,8 +399,11 @@ class AudioClassificationNode(Node):
 
     def audio_data_callback(self, msg: AudioDataStamped) -> None:
         """
-        resamples audio to be 16000 Hz, amplifies and filters audio, then appends clean audio to either the noise buffer
-        or a rolling buffer used for assessment
+        resamples audio to be 16000 Hz and appends raw audio to either the noise buffer or a rolling buffer
+        used for assessment. Amplification and noise filtering are applied once per window, right before
+        transcription (see transcription_timer_callback), rather than per packet here: normalizing/filtering
+        each ~30ms packet independently causes the AGC to blow background noise up to full scale during
+        silence and introduces discontinuities at packet boundaries once concatenated.
         :param msg: raw audio snippet
         :return: nothing
         """
@@ -359,14 +411,13 @@ class AudioClassificationNode(Node):
         buffered_audio_u8 = np.array(msg.audio.data, dtype=np.uint8)
         buffered_audio_16 = buffered_audio_u8.view(np.int16)
         buffered_audio_16 = AudioClassificationNode.resample_int16(buffered_audio_16, self.get_parameter('microphone_rate').value, 16000)
-        amplified_buffered_audio_16 = AudioClassificationNode.amplify_audio(buffered_audio_16, 1.4)
 
         # add microphone audio to noise buffer till noise buffer full
         if self.noise_buffer is None:
-            self.noise_buffer = amplified_buffered_audio_16
+            self.noise_buffer = buffered_audio_16
             return
         elif AudioClassificationNode.audio_length(self.noise_buffer, 16000.0) < self.get_parameter('noise_buffer_length_s').value:
-            self.noise_buffer = np.concatenate([self.noise_buffer, amplified_buffered_audio_16])
+            self.noise_buffer = np.concatenate([self.noise_buffer, buffered_audio_16])
             self.get_logger().debug(f"Noise Buffer (s): {AudioClassificationNode.audio_length(self.noise_buffer, 16000.0)}")
             return
         # noise buffer full here
@@ -375,24 +426,18 @@ class AudioClassificationNode(Node):
         if self.get_parameter('save_audio').value:
             self.save_audio(self.noise_buffer, self.get_parameter('path_to_saved_audio').value,  f'noise.wav', 16000)
 
-
-        # ignore any audio received while we are speaking, otherwise, filter and amplify the audio
+        # ignore any audio received while we are speaking (Spot's own voice)
         if self.stop_listening_start_time is not None and self.stop_listening_stop_time is not None and self.stop_listening_start_time <= self.get_clock().now() <= self.stop_listening_stop_time:
-            filtered_amplified_buffered_audio_16 = np.zeros_like(amplified_buffered_audio_16)
-        else:
-            filtered_amplified_buffered_audio_16 = AudioClassificationNode.filter_audio(
-                amplified_buffered_audio_16,
-                16000,
-                noise_sample=self.noise_buffer
-            )
+            buffered_audio_16 = np.zeros_like(buffered_audio_16)
 
-        # append the filtered and amplified audio to the buffer for later processing
-        self.rolling_buffer = np.concatenate([self.rolling_buffer, filtered_amplified_buffered_audio_16])[-self.rolling_samples:]
+        # append the raw audio to the buffer for later processing
+        self.rolling_buffer = np.concatenate([self.rolling_buffer, buffered_audio_16])[-self.rolling_samples:]
 
 def main(args=None) -> None:
     rclpy.init(args=args)
     audio_classification_node = AudioClassificationNode('audio_classification_node')
-    rclpy.spin(audio_classification_node)
+    executor = MultiThreadedExecutor()
+    rclpy.spin(audio_classification_node, executor=executor)
     rclpy.shutdown()
 
 
