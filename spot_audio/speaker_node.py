@@ -30,7 +30,7 @@ class SpeakerNode(Node):
         self.stop_listening_service_name_ = self.declare_parameter('stop_listening_service_name', 'stop_listening')
         
         # Target native PulseAudio sink
-        self.speaker_device_name_ = self.declare_parameter('speaker_device_name', 'robot_aec_speaker')
+        # self.speaker_device_name_ = self.declare_parameter('speaker_device_name', 'robot_aec_speaker')
 
         # Output file location
         self.output_file_ = self.declare_parameter('xtts_output_file', '/home/cdcl/cdcl_ws/src/spot_audio/data/output.wav')
@@ -48,7 +48,9 @@ class SpeakerNode(Node):
         self.heartbeat_timer_ = self.create_timer(2.5, self.heartbeat_callback)
 
         # initialize the native PulseAudio speaker device
-        self.speaker_device_ = PulseSpeakerDevice(self.speaker_device_name_.value)
+        # self.speaker_device_ = PulseSpeakerDevice(self.speaker_device_name_.value)
+        self.speaker_device_ = JackSpeakerDevice('alsa_output.pci-0000_00_1f.3.analog-stereo')
+        self.speaker_device_.set_device('alsa_output.pci-0000_00_1f.3.analog-stereo')
 
         # initialize the Kokoro model
         self.get_logger().info(f"Loading Kokoro Model...")
