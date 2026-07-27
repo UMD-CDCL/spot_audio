@@ -18,11 +18,12 @@ from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
+import re
 from scipy.signal import resample_poly
 from std_msgs.msg import Empty
 import time
 import torch
-from typing import Optional
+from typing import List, Optional
 import wave
 
 spot_name = os.environ['SPOT_NAME']
@@ -104,6 +105,11 @@ class AudioClassificationNode(Node):
         # are skipped because they may still be revised once more context arrives on the next tick
         self.published_until_time = None
         self.trailing_margin_s = 1.0
+        # trailing words we've actually published, used as a text-level safety net: faster-whisper's segment
+        # timestamps can jitter slightly between overlapping-window decodes, so a segment that's really a
+        # re-decode of already-published audio can occasionally slip past the timestamp check above
+        self.recent_published_words = []
+        self.dedupe_history_words = 12
 
         self.classification_timer_period_s = 1.25
         self.classification_chunks = max(1, round(
@@ -185,6 +191,28 @@ class AudioClassificationNode(Node):
         ).astype(np.int16)
 
     @staticmethod
+    def dedupe_leading_overlap(previous_words: List[str], new_words: List[str]) -> List[str]:
+        """
+        drops a leading run of new_words that duplicates the trailing run of previous_words, compared after
+        stripping punctuation/case, since overlapping transcription windows can re-decode the same words
+        with slightly different segment timestamps that slip past the timestamp-based de-dup in
+        transcription_timer_callback
+        :param previous_words: words already published, most recent last
+        :param new_words: words from the newly-decoded segment
+        :return: new_words with any duplicated leading run removed
+        """
+        def norm(word: str) -> str:
+            return re.sub(r'[^\w]', '', word.lower())
+
+        prev_norm = [norm(w) for w in previous_words]
+        new_norm = [norm(w) for w in new_words]
+        for overlap in range(min(len(prev_norm), len(new_norm)), 0, -1):
+            candidate = prev_norm[-overlap:]
+            if any(candidate) and candidate == new_norm[:overlap]:
+                return new_words[overlap:]
+        return new_words
+
+    @staticmethod
     def audio_length(buffered_audio: np.ndarray, rate: float) -> float:
         """
         computes length in seconds of audio snippet given its rate
@@ -219,7 +247,13 @@ class AudioClassificationNode(Node):
         :param msg:  the spot status message
         :return: nothing
         """
-        self.assessing = msg.state == SpotStatus.ASSESSING
+        is_assessing = msg.state == SpotStatus.ASSESSING
+        if is_assessing and not self.assessing:
+            # starting a new assessment session; don't let dedup state from a previous session suppress
+            # the first words of a new one
+            self.recent_published_words = []
+            self.published_until_time = None
+        self.assessing = is_assessing
 
     def stop_listening_callback(self, request, response):
         """
@@ -368,7 +402,12 @@ class AudioClassificationNode(Node):
                 prob_speech = 1.0 - segment.no_speech_prob
                 self.get_logger().debug(f"     [{segment.start:.2f} - {segment.end:.2f}] [{prob_speech:.3f}] {segment.text}")
                 if prob_speech > 0.7:
-                    self.finalized_speech_buffer += segment.text
+                    new_words = AudioClassificationNode.dedupe_leading_overlap(
+                        self.recent_published_words, segment.text.split()
+                    )
+                    if new_words:
+                        self.finalized_speech_buffer += (" " if self.finalized_speech_buffer else "") + " ".join(new_words)
+                        self.recent_published_words = (self.recent_published_words + new_words)[-self.dedupe_history_words:]
                 self.published_until_time = abs_end
 
             # Publish the audio we are confident in, then clear the speech buffer
