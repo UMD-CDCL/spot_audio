@@ -17,6 +17,8 @@ from rclpy.node import Node
 from rclpy.duration import Duration
 from std_msgs.msg import Header
 import time
+import wave
+
 
 
 class MicrophoneNode(Node):
@@ -28,6 +30,12 @@ class MicrophoneNode(Node):
         self.declare_parameter('microphone_sampling_freq_hz', 48000)  # 48000 for rode and 16000 for respeaker
         self.declare_parameter('main_channel', 0)
         self.pub_raw_audio = self.create_publisher(AudioDataStamped, 'raw_audio', 10)
+
+        # for saving audio to .wav
+        self.save_debug_audio = True
+        self.audio_buffer = bytearray()
+        self.record_start_time = None
+
 
         # create a microphone device
         self.microphone = UdpMicrophoneDevice(
@@ -61,6 +69,21 @@ class MicrophoneNode(Node):
             self._disconnect()
             self._reconnect()
     
+    def _save_to_wav(self) -> None:
+        filename = "/home/cdcl/cdcl_ws/debug_audio_10s.wav"
+        try:
+            with wave.open(filename, 'wb') as wf:
+                wf.setnchannels(1)  # Assuming mono based on main_channel logic
+                wf.setsampwidth(2)  # 16-bit PCM = 2 bytes
+                wf.setframerate(self.get_parameter('microphone_sampling_freq_hz').value)
+                wf.writeframes(self.audio_buffer)
+            self.get_logger().info(f"Successfully saved 10 seconds of raw audio to {filename}")
+        except Exception as e:
+            self.get_logger().error(f"Failed to save debug audio file: {e}")
+        finally:
+            # Free up memory once saved
+            self.audio_buffer.clear()
+
     def _disconnect(self) -> None:
         try:
             self.microphone.stop_stream()
@@ -73,9 +96,6 @@ class MicrophoneNode(Node):
         except Exception as e:
             self.get_logger().fatal(f"Encountered error while reconnecting to microphone. Error was {e}")
         
-        
-
-
 
     def on_received_audio(self, data, channel) -> None:
         """
@@ -87,6 +107,20 @@ class MicrophoneNode(Node):
         if channel == self.get_parameter('main_channel').value:
             # RØDE microphone publishes PCM 16 format audio data and AudioData requires raw uint8 bytes, publish
             arr_int16 = np.array(data, dtype=np.int16)
+
+            # NEW: 10-second debug recording logic
+            if self.save_debug_audio:
+                if self.record_start_time is None:
+                    self.record_start_time = self.get_clock().now()
+                
+                # Append raw bytes to our buffer
+                self.audio_buffer.extend(arr_int16.tobytes())
+
+                # Check if 10 seconds have elapsed
+                if self.get_clock().now() - self.record_start_time > Duration(seconds=10.0):
+                    self._save_to_wav()
+                    self.save_debug_audio = False  # Ensure we only do this once
+
             self.pub_raw_audio.publish(
                 AudioDataStamped(
                     header=Header(

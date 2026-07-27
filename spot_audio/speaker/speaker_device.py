@@ -129,3 +129,57 @@ class JackSpeakerDevice(SpeakerDevice):
         if self.device_name and os.path.exists(path_to_file) and os.path.isfile(path_to_file):
             # paplay --d="alsa_output.pci-0000_00_03.0.hdmi-stereo" filename.ogg
             os.system('paplay --d="' + self.device_name +  '" ' + path_to_file)
+
+
+import wave
+from pasimple import PaSimple, PA_STREAM_PLAYBACK, PA_SAMPLE_S16LE
+
+class PulseSpeakerDevice(SpeakerDevice):
+    def __init__(self, device_name: str = "robot_aec_speaker"):
+        """
+        Creates a native PulseAudio playback stream targeting the AEC sink.
+        :param device_name: The name of the PulseAudio sink to target.
+        """
+        self.device_name = device_name
+
+    def play_sound(self, path_to_file: str) -> None:
+        """
+        Plays a .wav file natively through PulseAudio Simple API.
+        """
+        if not os.path.exists(path_to_file) or not os.path.isfile(path_to_file):
+            warnings.warn(f"Audio file not found: {path_to_file}")
+            return
+
+        try:
+            with wave.open(path_to_file, 'rb') as wav_file:
+                # Extract audio parameters from the WAV file
+                sample_rate = wav_file.getframerate()
+                channels = wav_file.getnchannels()
+                
+                # Currently supporting 16-bit PCM as standard
+                if wav_file.getsampwidth() != 2:
+                    warnings.warn("PulseSpeakerDevice currently only supports 16-bit PCM WAV files.")
+                    return
+
+                # Read all raw byte data
+                audio_data = wav_file.readframes(wav_file.getnframes())
+
+            # Open a PulseAudio Simple connection for playback
+            with PaSimple(
+                PA_STREAM_PLAYBACK,
+                PA_SAMPLE_S16LE,
+                channels,
+                sample_rate,
+                app_name='SpeakerNode',
+                stream_name='Playback',
+                server_name=os.environ.get('PULSE_SERVER', None),
+                device_name=self.device_name
+            ) as pa:
+                # Write raw bytes to the PulseAudio server
+                pa.write(audio_data)
+                
+                # Wait until all data is played
+                pa.drain()
+
+        except Exception as e:
+            warnings.warn(f"Failed to play sound via PulseAudio: {e}")
