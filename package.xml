@@ -11,6 +11,7 @@
 
   <depend>audio_common_msgs</depend>
   <depend>cdcl_umd_msgs</depend>
+  <depend>diagnostic_msgs</depend>
   <depend>diagnostic_updater</depend>
 
   <test_depend>ament_lint_auto</test_depend>
