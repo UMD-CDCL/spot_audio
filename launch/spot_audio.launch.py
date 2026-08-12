@@ -16,6 +16,10 @@ def generate_launch_description():
             executable='microphone_node.py',
             name='microphone_node',
             output='log',
+            # Respawn so a crash or a fatal start error self-heals. The Pi keeps
+            # streaming regardless, so a respawn just re-attaches to the stream.
+            respawn=True,
+            respawn_delay=2.0,
         ),
         Node(
             package='spot_audio',
