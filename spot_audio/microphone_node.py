@@ -13,7 +13,6 @@ array.array through a fast path with no per-element validation and no copy,
 which matters here since this runs on every packet (~94 times a second).
 """
 
-import threading
 import wave
 
 from audio_common_msgs.msg import AudioData, AudioDataStamped
@@ -37,9 +36,9 @@ class MicrophoneNode(Node):
         self.declare_parameter('microphone_udp_port', 21885)
         self.declare_parameter('microphone_sampling_freq_hz', 48000)  # 48000 rode, 16000 respeaker
         self.declare_parameter('main_channel', 0)
-        # Seconds without audio before the stream is torn down and restarted.
-        # Must be comfortably longer than the watchdog period so a single late
-        # packet cannot trigger a reconnect.
+        # Seconds without audio before /diagnostics reports ERROR. Nothing is
+        # restarted on this side: a UDP socket has no connection to lose, and the
+        # Pi's own watchdog is what recovers the microphone.
         self.declare_parameter('audio_timeout_sec', 3.0)
         self.declare_parameter('conceal_packet_loss', True)
 
@@ -73,14 +72,10 @@ class MicrophoneNode(Node):
         self.clock_skew_warned = False
         self.published_count = 0
         self.concealed_count = 0
+        # True while an outage is being reported, so loss and recovery are each
+        # logged once instead of every second.
+        self.audio_lost_logged = False
 
-        # Reconnects run on their own thread. stop_stream() joins two worker
-        # threads, so doing it inline would block the executor for seconds and
-        # stall every other callback on this node.
-        self._reconnect_lock = threading.Lock()
-        self._reconnecting = False
-
-        self.watchdog_timer = self.create_timer(1.0, self.watchdog_callback)
         self.diagnostics_timer = self.create_timer(1.0, self.publish_diagnostics)
 
         try:
@@ -118,43 +113,6 @@ class MicrophoneNode(Node):
         self.clock_skew_warned = False
         return capture
 
-    # --------------------------------------------------------------- watchdog
-    def watchdog_callback(self) -> None:
-        if self.last_got_audio_data is None:
-            return
-
-        age = (self.get_clock().now() - self.last_got_audio_data).nanoseconds / 1e9
-        if age <= self.audio_timeout_sec:
-            return
-
-        with self._reconnect_lock:
-            if self._reconnecting:
-                return
-            self._reconnecting = True
-
-        self.get_logger().warning(
-            f'No audio for {age:.1f}s; restarting the UDP receiver')
-        threading.Thread(target=self._reconnect_worker, daemon=True,
-                         name='mic_reconnect').start()
-
-    def _reconnect_worker(self) -> None:
-        try:
-            self.microphone.stop_stream()
-        except Exception as exc:
-            self.get_logger().error(f'Error stopping audio stream: {exc}')
-
-        try:
-            self.microphone.start_stream()
-            # Reset the clock so the watchdog gives the fresh stream a full
-            # timeout window before considering another reconnect.
-            self.last_got_audio_data = self.get_clock().now()
-            self.get_logger().info('UDP audio receiver restarted')
-        except Exception as exc:
-            self.get_logger().error(f'Error restarting audio stream: {exc}')
-        finally:
-            with self._reconnect_lock:
-                self._reconnecting = False
-
     # ------------------------------------------------------------ diagnostics
     def publish_diagnostics(self) -> None:
         stats = self.microphone.get_stats()
@@ -175,6 +133,11 @@ class MicrophoneNode(Node):
             if age > self.audio_timeout_sec:
                 status.level = DiagnosticStatus.ERROR
                 status.message = f'no audio for {age:.1f}s'
+                if not self.audio_lost_logged:
+                    self.get_logger().warning(
+                        f'No audio for {age:.1f}s. The Pi watchdog recovers the '
+                        f'microphone; check journalctl -u mic-sensor.service there.')
+                    self.audio_lost_logged = True
             elif stats['queue_overflows'] > 0:
                 status.level = DiagnosticStatus.WARN
                 status.message = 'publish path falling behind (queue overflows)'
@@ -184,6 +147,10 @@ class MicrophoneNode(Node):
             else:
                 status.level = DiagnosticStatus.OK
                 status.message = 'streaming'
+
+            if age <= self.audio_timeout_sec and self.audio_lost_logged:
+                self.get_logger().info('Audio resumed')
+                self.audio_lost_logged = False
 
         status.values = [
             KeyValue(key='packets_received', value=str(stats['packets_received'])),
