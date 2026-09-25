@@ -21,13 +21,12 @@ def generate_launch_description():
             respawn=True,
             respawn_delay=2.0,
         ),
-        Node(
-            package='spot_audio',
-            namespace=spot_name,
-            executable='audio_classification_node.py',
-            name='audio_classification_node',
-            output='log',
-        ),
+        # audio_classification_node (AST + faster-whisper) was replaced by
+        # spot_assessment_node, which scores the assessment's audio with Gemma,
+        # transcribes the casualty's replies with Whisper, and grades them. It still
+        # needs microphone_node's raw_audio and speaker_node's speaker/voice (the
+        # robot's own questions), so both stay. speaker_node's stop_listening client
+        # now has no server; its call is fire-and-forget, so that is harmless.
         Node(
             package='spot_audio',
             namespace=spot_name,
