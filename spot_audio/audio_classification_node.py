@@ -1,484 +1,425 @@
-#!/usr/bin/env python3
+#!/home/cdcl/.venv/bin/python
+# NOTE ON THE SHEBANG: AST needs torch + transformers, which live in
+# /home/cdcl/.venv rather than the system python3 that ROS nodes normally run
+# under. ROS's own PYTHONPATH still puts rclpy and the message packages on the
+# path, so this interpreter imports both stacks.
+#
+# WHISPER IS NOT IMPORTABLE FROM THIS INTERPRETER ON THIS MACHINE. The checkpoint
+# in models/whisper is CTranslate2, and faster-whisper was deliberately installed
+# into roboscout-assessment/audio_classification/venv_whisper -- with its own
+# cuBLAS/cuDNN wheels -- so that the main environment every other node shares was
+# left untouched. So `backends` defaults to AST only here, the node logs plainly
+# when Whisper is unavailable instead of failing, and the Whisper numbers for the
+# validation set come from scripts/run_whisper_baseline.sh in that venv. On a robot
+# where both libraries share one environment, set backends:="['ast','whisper']".
 
+"""
+Classifies casualty audio with the AST + Whisper baseline, in the same shape as
+gemma_audio_classification_node.py so the two can be compared directly.
 
-from audio_common_msgs.msg import AudioData, AudioDataStamped
-from cdcl_umd_msgs.msg import Observation, ObservationModule, ObservationDataSource, SpotStatus
-from cdcl_umd_msgs.srv import StopListening
-from faster_whisper import WhisperModel
-import math
-from microphone.audio_classifier import MaxArgStrategy
-import noisereduce as nr
-import numpy as np
+Publishes, per analysis window, an Observation per label:
+  ast_respiratory_distress  -- [P(absent), P(present)]
+  ast_alertness_verbal      -- [P(normal), P(abnormal), P(absent)]
+  whisper_alertness_verbal  -- [P(normal), P(abnormal), P(absent)], when Whisper runs
+
+WHAT CHANGED FROM THE PREVIOUS VERSION OF THIS NODE, and why
+  - 5 s rolling buffer on two wall-clock timers -> the same 30 s window / 15 s hop
+    the Gemma node uses, advanced by SAMPLE COUNT. The old timers assumed playback
+    at 1x, so replaying a bag at 5x silently changed how much audio each
+    classification saw; that alone made the old node impossible to evaluate
+    honestly against anything.
+  - AST was run on ONE chunk of the rolling buffer and the rest discarded. It now
+    sees the whole window, in the 10.24 s pieces its feature extractor accepts.
+  - the AudioSet label groups were rebuilt -- the old respiratory-distress set
+    included "Throat clearing" and "Sneeze" while omitting "Gasp", and verbal
+    alertness had two of its three classes commented out so 'absent' could never be
+    predicted at all. See microphone/ast_whisper_assessor.py.
+  - noise reduction and peak-normalizing amplification are gone. The AGC blew room
+    tone up to full scale during silence, which actively misleads a classifier asked
+    whether anyone is vocalizing.
+  - the two-layer transcript de-duplication is gone with the overlapping 1.5 s
+    timer that made it necessary.
+  - added: a finalize service, per-recording artifacts, a reasoning topic, and an
+    ObservationDataSource carrying the full window of audio -- all matching the
+    Gemma node, so one set of aggregation scripts reads both.
+
+Live behaviour that is deliberately preserved: the stop_listening service, the
+heartbeat, spot_status gating, and speech publication on 'speech'.
+"""
+
+import array
+import json
 import os
+import queue
 import random
+import threading
+
+from audio_common_msgs.msg import AudioDataStamped
+from cdcl_umd_msgs.msg import Observation, ObservationDataSource, SpotStatus
+from cdcl_umd_msgs.srv import StopListening
+from microphone.ast_whisper_assessor import AstWhisperAssessor
+from microphone.audio_window_buffer import StreamingAudioWindower
+from microphone.gemma_audio_assessor import SAMPLE_RATE, pcm16_to_float32
+from microphone.recording_artifacts import RecordingArtifactWriter, window_row
+import numpy as np
 import rclpy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
-from rclpy.duration import Duration
 from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.time import Time
-import re
-from scipy.signal import resample_poly
-from std_msgs.msg import Empty
-import time
-import torch
-from typing import List, Optional
-import wave
+from std_msgs.msg import Empty, String
+from std_srvs.srv import Trigger
 
-spot_name = os.environ['SPOT_NAME']
+# Which ObservationModule constant each task is published under, per backend. These
+# names are what the Bayesian network's emission nodes key on, so they are fixed by
+# cdcl_umd_msgs/ObservationModule.msg rather than chosen here.
+OBSERVATION_MODULES = {
+    'ast': {'respiratory_distress': 'ast_respiratory_distress',
+            'alertness_verbal': 'ast_alertness_verbal'},
+    'whisper': {'alertness_verbal': 'whisper_alertness_verbal'},
+}
 
+_SHUTDOWN = object()
 
 
 class AudioClassificationNode(Node):
-    def __init__(self, node_name: str):
-        super().__init__(node_name, allow_undeclared_parameters=True, automatically_declare_parameters_from_overrides=True)
+    def __init__(self, node_name: str = 'audio_classification_node'):
+        super().__init__(node_name)
 
-        # separate callback groups so incoming audio keeps flowing while whisper/AST are busy decoding on
-        # the processing group; both use a MultiThreadedExecutor (see main())
         self.audio_callback_group = MutuallyExclusiveCallbackGroup()
-        self.processing_callback_group = MutuallyExclusiveCallbackGroup()
+        self.service_callback_group = MutuallyExclusiveCallbackGroup()
 
-        # the microphone parameters and microphone raw data
-        self.declare_parameter('microphone_rate', 48000)
-        self.sub_audio_data = self.create_subscription(
-            AudioDataStamped,
-            '/' + spot_name + '/raw_audio',
-            self.audio_data_callback,
-            50,
-            callback_group=self.audio_callback_group
-        )
-
-        # noise buffer contains noise sample from environment
-        self.declare_parameter('noise_buffer_length_s', 5.0)  # length of noise buffer in seconds
-        self.noise_buffer = None
-
-        # rolling buffer contains the audio we transcribe
-        self.declare_parameter('rolling_window_period_s', 5.0)
-        self.rolling_samples = int(self.get_parameter('rolling_window_period_s').value * 16000)  # 16000 is the target sample rate
-        self.rolling_buffer = np.zeros(self.rolling_samples, dtype=np.int16)
-
-        # AST (audio classifier)
-        self.declare_parameter('path_to_classifier', "/home/cdcl/cdcl_ws/models/alertness_verbal_classifiers/")
-        self.audio_classification_strategy = MaxArgStrategy(
-            self.get_parameter('path_to_classifier').value,
-            self.get_logger()
-        )
-        self.audio_classification_strategy.load_classifier()
-
-        # whisper (stt model)
+        # ---------------------------------------------------------------- models
+        self.declare_parameter('path_to_classifier',
+                               '/home/cdcl/cdcl_ws/models/alertness_verbal_classifiers/')
         self.declare_parameter('path_to_whisper', '/home/cdcl/cdcl_ws/models/whisper/')
-        self.transcriber = WhisperModel(
-            self.get_parameter('path_to_whisper').value,
-            device='cuda',
-            compute_type='float16',
-            local_files_only=False
+        # See the shebang comment: Whisper is not importable from this interpreter on
+        # this machine, so AST alone is the default and asking for Whisper degrades
+        # with a warning rather than refusing to start.
+        self.declare_parameter('backends', ['ast'])
+        self.declare_parameter('device', 'cuda')
+        # Whisper's Silero VAD. The previous node ran with it ON, which is the honest
+        # default to keep -- but it rejects most of this validation set outright, and
+        # a rejected window is a silent prediction of 'absent'.
+        self.declare_parameter('whisper_vad', True)
+        self.declare_parameter('publish_raw_audio', True)
+
+        # ---------------------------------------------------------------- audio
+        self.declare_parameter('audio_topic', 'raw_audio')
+        self.declare_parameter('input_sample_rate', 48000)
+        self.declare_parameter('input_channels', 2)
+        self.declare_parameter('channel_mode', 'mix')
+        self.declare_parameter('window_s', 30.0)
+        self.declare_parameter('hop_s', 15.0)
+        self.declare_parameter('min_tail_s', 1.0)
+
+        # ------------------------------------------------------------ behaviour
+        self.declare_parameter('require_assessing', True)
+        self.declare_parameter('platform_name', os.environ.get('SPOT_NAME', 'unknown'))
+
+        # ------------------------------------------------------------- artifacts
+        self.declare_parameter('save_artifacts', False)
+        self.declare_parameter('output_dir', '')
+        self.declare_parameter('recording_name', '')
+        self.declare_parameter('labels_json', '')
+
+        self.platform_name = self.get_parameter('platform_name').value
+        requested = [str(b) for b in self.get_parameter('backends').value]
+
+        self.windower = StreamingAudioWindower(
+            input_rate=int(self.get_parameter('input_sample_rate').value),
+            target_rate=SAMPLE_RATE,
+            channels=int(self.get_parameter('input_channels').value),
+            channel_mode=str(self.get_parameter('channel_mode').value),
+            window_s=float(self.get_parameter('window_s').value),
+            hop_s=float(self.get_parameter('hop_s').value),
+            min_tail_s=float(self.get_parameter('min_tail_s').value),
         )
 
-        # the speech we heard the person say + output of classifiers
-        self.pub_speech = self.create_publisher(ObservationDataSource, 'speech', 10)
-        self.finalized_speech_buffer = ""
-        self.pub_observation = self.create_publisher(Observation, 'observation_no_id', 10)
-        self.pub_observation_data_source = self.create_publisher(ObservationDataSource, 'observation_data_sources', 10)
+        self.assessor = AstWhisperAssessor(
+            ast_path=str(self.get_parameter('path_to_classifier').value),
+            whisper_path=str(self.get_parameter('path_to_whisper').value),
+            backends=requested,
+            device=str(self.get_parameter('device').value),
+            whisper_vad=bool(self.get_parameter('whisper_vad').value),
+            logger=self.get_logger(),
+        )
+        try:
+            self.assessor.load()
+        except ImportError as exc:
+            # Losing Whisper should cost the Whisper numbers, not the whole node.
+            if 'whisper' not in requested:
+                raise
+            self.get_logger().warning(
+                f'Whisper backend unavailable in this interpreter ({exc}); continuing '
+                f'with AST only. Whisper lives in venv_whisper -- see '
+                f'scripts/run_whisper_baseline.sh.')
+            self.assessor.backends = tuple(b for b in requested if b != 'whisper')
+            self.assessor.load()
+        self.tasks = self.assessor.supported_tasks()
+        self.active_backends = tuple(self.assessor.backends)
 
-        # we stop listening to the audio, when Spot is speaking
-        self.stop_listening_service = self.create_service(StopListening, 'stop_listening', self.stop_listening_callback)
+        # Unbounded on purpose: dropping audio would make an evaluation silently
+        # measure less than the whole recording. Finalize waits for the backlog.
+        self.work_queue = queue.Queue()
+        self.max_backlog = 0
+        self.rows = []
+        self.notes = []
+        self.recording_started_at = None
+        self.rows_lock = threading.Lock()
+        self.buffer_lock = threading.Lock()
+        self.worker = threading.Thread(target=self._worker_loop, daemon=True,
+                                       name='ast_whisper_inference')
+        self.worker.start()
+
+        self.sub_audio_data = self.create_subscription(
+            AudioDataStamped, str(self.get_parameter('audio_topic').value),
+            self.audio_data_callback, 50, callback_group=self.audio_callback_group)
+        self.sub_spot_status = self.create_subscription(
+            SpotStatus, 'spot_status', self.spot_status_callback, qos_profile_sensor_data)
+        self.assessing = not bool(self.get_parameter('require_assessing').value)
+
+        self.pub_observation = self.create_publisher(Observation, 'observation_no_id', 10)
+        self.pub_observation_data_source = self.create_publisher(
+            ObservationDataSource, 'observation_data_sources', 10)
+        self.pub_speech = self.create_publisher(ObservationDataSource, 'speech', 10)
+        self.pub_reasoning = self.create_publisher(
+            String, 'audio_classification/reasoning', 10)
+        self.pub_heartbeat = self.create_publisher(
+            Empty, 'audio_classification/heartbeat', 10)
+        self.heartbeat_timer = self.create_timer(2.5, self.heartbeat_callback)
+
+        # Preserved from the previous node: the speaker calls this before it talks so
+        # the robot never transcribes its own voice.
+        self.stop_listening_service = self.create_service(
+            StopListening, 'stop_listening', self.stop_listening_callback)
         self.stop_listening_start_time = None
         self.stop_listening_stop_time = None
 
-        # whether we should save audio we record and where to save it
-        self.seq = 0
-        self.declare_parameter('path_to_saved_audio', '/home/cdcl/cdcl_ws/audio')
-        self.declare_parameter('save_audio', False)
+        self.finalize_service = self.create_service(
+            Trigger, '~/finalize_recording', self.finalize_callback,
+            callback_group=self.service_callback_group)
 
-        # how frequently to process the audio buffer. Ticking faster than the window length lets
-        # consecutive windows overlap, so a word cut at one window's trailing edge gets full context
-        # (and gets published) on a later tick instead of being lost/garbled at a hard 5s boundary.
-        self.transcription_timer_period_s = 1.5
-        self.transcription_timer = self.create_timer(
-            self.transcription_timer_period_s,
-            self.transcription_timer_callback,
-            callback_group=self.processing_callback_group
-        )
-        # segments already finalized up to this absolute time; segments before it are skipped as
-        # duplicates from a prior overlapping window, and segments within trailing_margin_s of "now"
-        # are skipped because they may still be revised once more context arrives on the next tick
-        self.published_until_time = None
-        self.trailing_margin_s = 1.0
-        # trailing words we've actually published, used as a text-level safety net: faster-whisper's segment
-        # timestamps can jitter slightly between overlapping-window decodes, so a segment that's really a
-        # re-decode of already-published audio can occasionally slip past the timestamp check above
-        self.recent_published_words = []
-        self.dedupe_history_words = 12
+        self.get_logger().info(
+            f"Ready. backends={list(self.active_backends)} "
+            f"tasks={[t.name for t in self.tasks]} "
+            f"topic={self.get_parameter('audio_topic').value} "
+            f"window={self.get_parameter('window_s').value}s "
+            f"hop={self.get_parameter('hop_s').value}s "
+            f"require_assessing={self.get_parameter('require_assessing').value}")
 
-        self.classification_timer_period_s = 1.25
-        self.classification_chunks = max(1, round(
-            self.get_parameter('rolling_window_period_s').value / self.classification_timer_period_s
-        ))
-        self.classification_timer = self.create_timer(
-            self.classification_timer_period_s,
-            self.classification_timer_callback,
-            callback_group=self.processing_callback_group
-        )
-
-        # only process audio while we are assessing
-        self.sub_spot_status = self.create_subscription(SpotStatus, 'spot_status', self.spot_status_callback, qos_profile_sensor_data)
-        self.assessing = False
-
-        # heart beat stuff
-        self.pub_heartbeat = self.create_publisher(
-            Empty,
-            'audio_classification/heartbeat',
-            10
-        )
-        self.heartbeat_timer = self.create_timer(2.5, self.heartbeat_callback)
-
+    # --------------------------------------------------------------- callbacks
     def heartbeat_callback(self) -> None:
-        """
-        sends a heartbeat message so the spot status publisher knows if whisper + AST are working
-        :return: nothing
-        """
         self.pub_heartbeat.publish(Empty())
 
-    @staticmethod
-    def amplify_audio(buffered_audio: np.ndarray, gain: float=1.0) -> np.ndarray:
-        """
-        amplifies audio buffer by gain (w/out saturating)
-        :param buffered_audio: audio in PCM 16 format mono
-        :param gain: constant to multiply audio by
-        :return: amplified audio
-        """
-        peak = np.max(np.abs(buffered_audio))
-        if peak < 1:
-            # near/total silence: skip amplification instead of dividing by ~0 and blowing noise up to full scale
-            return buffered_audio
-        gain = gain * float(2**15 - 1) / peak
-        return np.clip(buffered_audio.astype(np.float32) * gain, -2**15, 2**15 - 1).astype(np.int16)
-
-    @staticmethod
-    def resample_int16(buffered_audio: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-        """
-        Resample a 1D int16 signal using polyphase filtering (high quality / fast).
-        :param buffered_audio: audio in PCM 16 format mono (np.int16)
-        :param orig_sr: original sample rate
-        :param target_sr: target sample rate
-        :return: resampled audio buffer in PCM 16 format mono (np.int16)
-        """
-        if orig_sr == target_sr:
-            return buffered_audio
-        g = math.gcd(orig_sr, target_sr)
-        up = target_sr // g
-        down = orig_sr // g
-        y = resample_poly(buffered_audio.astype(np.float32), up, down)
-        return np.clip(y, -32768, 32767).astype(np.int16)
-
-    @staticmethod
-    def filter_audio(buffered_audio: np.ndarray, rate: int, noise_sample: Optional[np.ndarray]=None):
-        """
-        filters audio buffer using noisereduce package
-        :param buffered_audio: the audio to be filtered (PCM 16, np.int16, mono)
-        :param rate: the rate at which audio is sampled
-        :param noise_sample: a sample of the noise (PCM 16, np.int16, mono)
-        :return: filtered audio  (PCM 16, np.int16, mono)
-        """
-        return nr.reduce_noise(
-            y=buffered_audio,
-            y_noise=noise_sample,
-            sr=rate,
-            stationary=True,
-            prop_decrease=0.8,
-            n_fft=512,
-        ).astype(np.int16)
-
-    @staticmethod
-    def dedupe_leading_overlap(previous_words: List[str], new_words: List[str]) -> List[str]:
-        """
-        drops a leading run of new_words that duplicates the trailing run of previous_words, compared after
-        stripping punctuation/case, since overlapping transcription windows can re-decode the same words
-        with slightly different segment timestamps that slip past the timestamp-based de-dup in
-        transcription_timer_callback
-        :param previous_words: words already published, most recent last
-        :param new_words: words from the newly-decoded segment
-        :return: new_words with any duplicated leading run removed
-        """
-        def norm(word: str) -> str:
-            return re.sub(r'[^\w]', '', word.lower())
-
-        prev_norm = [norm(w) for w in previous_words]
-        new_norm = [norm(w) for w in new_words]
-        for overlap in range(min(len(prev_norm), len(new_norm)), 0, -1):
-            candidate = prev_norm[-overlap:]
-            if any(candidate) and candidate == new_norm[:overlap]:
-                return new_words[overlap:]
-        return new_words
-
-    @staticmethod
-    def audio_length(buffered_audio: np.ndarray, rate: float) -> float:
-        """
-        computes length in seconds of audio snippet given its rate
-        :param buffered_audio: audio sample (PCM 16, np.int16, mono)
-        :param rate: the rate at which the audio is sampled
-        :return: nothing
-        """
-        if buffered_audio is None:
-            return 0
-        return len(buffered_audio) / rate
-
-    def save_audio(self, buffered_audio: np.ndarray, path: str, file_name: str, rate: int) -> None:
-        """
-        saves an audio segment to a provided path / filename as a .wav file
-        :param buffered_audio: the audio (PCM 16, mono)
-        :param path: path to save audio .wav file
-        :param file_name: name of file
-        :param rate: rate at which audio is sampled
-        :return: nothing
-        """
-        wav_path = os.path.join(path, file_name)
-        self.seq += 1
-        with wave.open(wav_path, 'wb') as wf:
-            wf.setnchannels(1)
-            wf.setsampwidth(2)
-            wf.setframerate(rate)
-            wf.writeframes(buffered_audio.tobytes())
-
     def spot_status_callback(self, msg: SpotStatus) -> None:
-        """
-        sets self.assessing to true if we are assessing, otherwise it's set to false
-        :param msg:  the spot status message
-        :return: nothing
-        """
-        is_assessing = msg.state == SpotStatus.ASSESSING
-        if is_assessing and not self.assessing:
-            # starting a new assessment session; don't let dedup state from a previous session suppress
-            # the first words of a new one
-            self.recent_published_words = []
-            self.published_until_time = None
-        self.assessing = is_assessing
+        if not bool(self.get_parameter('require_assessing').value):
+            return
+        self.assessing = msg.state == SpotStatus.ASSESSING
 
     def stop_listening_callback(self, request, response):
         """
-        assigns values "self.stop_listening_start_time" and "self.stop_listening_stop_time", which the node will use
-        to ignore any audio heard within those two time stamps
-        :param request: the ros2 request
-        :param response: the response
-        :return:
+        Records the window during which the robot is speaking, so its own voice is
+        muted rather than classified as the casualty's.
+        :return: the populated response
         """
-        self.get_logger().info(f"Processing request to stop listening.")
         self.stop_listening_start_time = Time.from_msg(request.stop_listen_time)
         self.stop_listening_stop_time = Time.from_msg(request.start_listen_time)
         response.success = True
-        self.get_logger().info(f"Processed request to stop listening. Stop Listening Starting: {self.stop_listening_start_time}, Stop Listening Ending: {self.stop_listening_stop_time}")
+        self.get_logger().info(
+            f'Muting audio between {self.stop_listening_start_time} and '
+            f'{self.stop_listening_stop_time}')
         return response
-
-    def classification_timer_callback(self) -> None:
-        """
-        classifies the audio buffer
-        :return: nothing
-        """
-        # only process audio when we are assessing
-        if not self.assessing or self.noise_buffer is None or self.rolling_buffer is None:
-            return
-
-        noise_buffer_length_s = AudioClassificationNode.audio_length(self.noise_buffer, 16000.0)
-        rolling_buffer_length_s = AudioClassificationNode.audio_length(self.rolling_buffer, 16000.0)
-        noise_buffer_full = noise_buffer_length_s >= self.get_parameter('noise_buffer_length_s').value
-        rolling_buffer_full = rolling_buffer_length_s >= self.get_parameter('rolling_window_period_s').value
-        if noise_buffer_full and rolling_buffer_full:
-            self.get_logger().debug(f'Before processing, buffer length (s): {rolling_buffer_length_s}')
-
-            # classify the audio (classify 1 second chunks)
-            start = time.time()
-            chunks = np.array_split(self.rolling_buffer, self.classification_chunks)
-            classification_tensor = self.audio_classification_strategy.classify_audio(
-                chunks[-1]
-                # AudioClassificationNode.pcm_to_f32(chunks[-1])
-            )
-            classifications = self.audio_classification_strategy.apply_strategy(classification_tensor)
-
-            # if we got a valid output, then publish observation + observation data source messages
-            if classifications is not None:
-                respiratory_distress_classification, verbal_alertness_classification = classifications
-                respiratory_distress_label = torch.argmax(respiratory_distress_classification).item()
-                verbal_alertness_label = torch.argmax(verbal_alertness_classification).item()
-
-                data_source = ObservationDataSource(
-                    data_source_id=random.randint(-2**31, 2**31 - 1),
-                    raw_audio=self.rolling_buffer.view(np.uint8).tolist(),
-                    platform_name=spot_name
-                )
-                published_observation = False
-                if not torch.isnan(verbal_alertness_classification).any().item():
-                    alertness_verbal_observation = Observation(
-                        stamp=self.get_clock().now().to_msg(),
-                        platform_name=spot_name,
-                        data_source_id=data_source.data_source_id,
-                        observation_module = ObservationModule.AST_ALERTNESS_VERBAL,
-                        observation=verbal_alertness_classification.tolist()
-                    )
-                    # if alertness_verbal_observation.observation[0] >= 0.6:
-                    self.pub_observation.publish(alertness_verbal_observation)
-                    published_observation = True
-                if not torch.isnan(respiratory_distress_classification).any().item():
-                    respiratory_distress_observation = Observation(
-                        stamp=self.get_clock().now().to_msg(),
-                        platform_name=spot_name,
-                        data_source_id=data_source.data_source_id,
-                        observation_module = ObservationModule.AST_RESPIRATORY_DISTRESS,
-                        observation=respiratory_distress_classification.tolist()
-                    )
-                    self.pub_observation.publish(respiratory_distress_observation)
-                    published_observation = True
-
-                if published_observation:
-                    self.pub_observation_data_source.publish(data_source)
-
-                # print out the label for the user
-                self.get_logger().debug(f"Respiratory Distress: {respiratory_distress_label}, Verbal Alertness: {verbal_alertness_label}")
-            stop = time.time()
-            self.get_logger().debug(f"Took {stop-start:.2f} s to classify audio.")
-
-    def transcription_timer_callback(self) -> None:
-        """
-        transcribes the audio buffer, publishing only the newly-confirmed portion of each window so that
-        overlapping windows don't duplicate text and words on a window boundary get finalized once they
-        have full context
-        :return: nothing
-        """
-        # only process audio when we are assessing
-        if not self.assessing:
-            return
-
-        # if noise and rolling buffers are both full, then we can proceed with processing the rolling window buffer
-        noise_buffer_length_s = AudioClassificationNode.audio_length(self.noise_buffer, 16000.0)
-        rolling_buffer_length_s = AudioClassificationNode.audio_length(self.rolling_buffer, 16000.0)
-        noise_buffer_full = noise_buffer_length_s >= self.get_parameter('noise_buffer_length_s').value
-        rolling_buffer_full = rolling_buffer_length_s >= self.get_parameter('rolling_window_period_s').value
-        self.get_logger().debug(f'Before processing, buffer length (s): {rolling_buffer_length_s}')
-        if noise_buffer_full and rolling_buffer_full:
-
-            window_duration = Duration(seconds=self.get_parameter('rolling_window_period_s').value)
-            now = self.get_clock().now()
-            if now.nanoseconds <= window_duration.nanoseconds:
-                # clock (e.g. sim time) hasn't advanced far enough yet to form a valid absolute window start
-                return
-            window_start_time = now - window_duration
-            if self.published_until_time is None:
-                self.published_until_time = window_start_time
-
-            # clean the audio once per window (instead of per ~30ms packet) so noise reduction has enough
-            # context to work with and the AGC doesn't repeatedly blow up background noise between packets
-            clean_window = AudioClassificationNode.filter_audio(self.rolling_buffer, 16000, noise_sample=self.noise_buffer)
-            clean_window = AudioClassificationNode.amplify_audio(clean_window, 1.4)
-
-            # save the audio file for debugging before transcription
-            if self.get_parameter('save_audio').value:
-                self.save_audio(
-                    clean_window,
-                    self.get_parameter('path_to_saved_audio').value,
-                    f'{self.seq}.wav',
-                    16000
-                )
-
-            # transcribe the rolling buffer, timing how long it takes
-            start = time.time()
-            segments_gen, info = self.transcriber.transcribe(
-                AudioClassificationNode.pcm_to_f32(clean_window),
-                language='en',
-                task='transcribe',
-                vad_filter=True,  # suppress hallucinated text over silence/non-speech
-                condition_on_previous_text=False  # don't let one hallucinated segment bias the next
-            )
-            stop = time.time()
-            self.get_logger().debug(f'Took {stop - start:.2f} s to transcribe audio.')  # takes 0.05-0.07 seconds on HP
-
-            # add speech we are confident in to "finalized speech buffer" for later publishing, skipping
-            # anything already published by a prior overlapping window or still too close to the live edge
-            live_edge_time = now - Duration(seconds=self.trailing_margin_s)
-            for segment in segments_gen:
-                abs_start = window_start_time + Duration(seconds=segment.start)
-                abs_end = window_start_time + Duration(seconds=segment.end)
-                if abs_start < self.published_until_time or abs_end > live_edge_time:
-                    continue
-                prob_speech = 1.0 - segment.no_speech_prob
-                self.get_logger().debug(f"     [{segment.start:.2f} - {segment.end:.2f}] [{prob_speech:.3f}] {segment.text}")
-                if prob_speech > 0.7:
-                    new_words = AudioClassificationNode.dedupe_leading_overlap(
-                        self.recent_published_words, segment.text.split()
-                    )
-                    if new_words:
-                        self.finalized_speech_buffer += (" " if self.finalized_speech_buffer else "") + " ".join(new_words)
-                        self.recent_published_words = (self.recent_published_words + new_words)[-self.dedupe_history_words:]
-                self.published_until_time = abs_end
-
-            # Publish the audio we are confident in, then clear the speech buffer
-            self.get_logger().debug(f'Speech: {self.finalized_speech_buffer}')
-            if len(self.finalized_speech_buffer) != 0:
-                speech = ObservationDataSource(
-                    data_source_id=random.randint(-2**31, 2**31 - 1),
-                    raw_audio=self.rolling_buffer.view(np.uint8).tolist(),
-                    platform_name=spot_name,
-                    audio_transcript=self.finalized_speech_buffer
-                )
-                self.pub_speech.publish(speech)
-            self.finalized_speech_buffer = ""
-
-
-    @staticmethod
-    def pcm_to_f32(raw_audio, bit_depth: type = np.int16):
-        """
-        convert PCM audio data from bytes to a numpy float array normalized to +/- 1.0
-        :param raw_audio: the raw audio buffer
-        :param bit_depth: the bit depth of the PCM signal (usually 16)
-        :return: A numpy array containing the audio data as float values normalized between -1 and 1.
-        """
-        raw_data = np.frombuffer(buffer=raw_audio, dtype=bit_depth)
-        max_amplitude = float(2 ** (bit_depth(0).nbytes * 8 - 1))  # 16 => 32768.0 (2^(16-1))
-        return raw_data.astype(np.float32) / max_amplitude
-
 
     def audio_data_callback(self, msg: AudioDataStamped) -> None:
         """
-        resamples audio to be 16000 Hz and appends raw audio to either the noise buffer or a rolling buffer
-        used for assessment. Amplification and noise filtering are applied once per window, right before
-        transcription (see transcription_timer_callback), rather than per packet here: normalizing/filtering
-        each ~30ms packet independently causes the AGC to blow background noise up to full scale during
-        silence and introduces discontinuities at packet boundaries once concatenated.
-        :param msg: raw audio snippet
+        Buffers one packet and queues any window it completed.
         :return: nothing
         """
-
-        buffered_audio_u8 = np.array(msg.audio.data, dtype=np.uint8)
-        buffered_audio_16 = buffered_audio_u8.view(np.int16)
-        buffered_audio_16 = AudioClassificationNode.resample_int16(buffered_audio_16, self.get_parameter('microphone_rate').value, 16000)
-
-        # add microphone audio to noise buffer till noise buffer full
-        if self.noise_buffer is None:
-            self.noise_buffer = buffered_audio_16
+        if not self.assessing:
             return
-        elif AudioClassificationNode.audio_length(self.noise_buffer, 16000.0) < self.get_parameter('noise_buffer_length_s').value:
-            self.noise_buffer = np.concatenate([self.noise_buffer, buffered_audio_16])
-            self.get_logger().debug(f"Noise Buffer (s): {AudioClassificationNode.audio_length(self.noise_buffer, 16000.0)}")
-            return
-        # noise buffer full here
+        pcm = np.frombuffer(memoryview(msg.audio.data), dtype=np.int16)
+        if (self.stop_listening_start_time is not None
+                and self.stop_listening_stop_time is not None
+                and self.stop_listening_start_time <= self.get_clock().now()
+                <= self.stop_listening_stop_time):
+            pcm = np.zeros_like(pcm)
+        with self.buffer_lock:
+            if self.recording_started_at is None:
+                self.recording_started_at = self.get_clock().now().nanoseconds / 1e9
+            windows = self.windower.add_packet(pcm)
+        for window in windows:
+            self.work_queue.put(window)
+        self.max_backlog = max(self.max_backlog, self.work_queue.qsize())
 
-        # save the noise buffer
-        if self.get_parameter('save_audio').value:
-            self.save_audio(self.noise_buffer, self.get_parameter('path_to_saved_audio').value,  f'noise.wav', 16000)
+    def _worker_loop(self) -> None:
+        while True:
+            item = self.work_queue.get()
+            try:
+                if item is _SHUTDOWN:
+                    return
+                self._process_window(*item)
+            except Exception as exc:
+                self.get_logger().error(f'Window scoring failed: {exc}')
+            finally:
+                self.work_queue.task_done()
 
-        # ignore any audio received while we are speaking (Spot's own voice)
-        if self.stop_listening_start_time is not None and self.stop_listening_stop_time is not None and self.stop_listening_start_time <= self.get_clock().now() <= self.stop_listening_stop_time:
-            buffered_audio_16 = np.zeros_like(buffered_audio_16)
+    def _process_window(self, start_s: float, end_s: float, pcm: np.ndarray) -> None:
+        """
+        Scores one window, publishes its observations, and records a result row.
+        :return: nothing
+        """
+        audio = pcm16_to_float32(pcm)
+        assessment = self.assessor.assess_window(audio)
 
-        # append the raw audio to the buffer for later processing
-        self.rolling_buffer = np.concatenate([self.rolling_buffer, buffered_audio_16])[-self.rolling_samples:]
+        data_source = ObservationDataSource(
+            data_source_id=random.randint(-2**31, 2**31 - 1),
+            # array.array('B') hits rclpy's zero-validation fast path for uint8[].
+            raw_audio=(array.array('B', pcm.tobytes())
+                       if bool(self.get_parameter('publish_raw_audio').value)
+                       else array.array('B')),
+            platform_name=self.platform_name,
+            audio_transcript=assessment.note or '',
+        )
+        stamp = self.get_clock().now().to_msg()
+        for task in self.tasks:
+            for backend in self.active_backends:
+                module = OBSERVATION_MODULES.get(backend, {}).get(task.name)
+                if module is None:
+                    continue
+                self.pub_observation.publish(Observation(
+                    stamp=stamp,
+                    platform_name=self.platform_name,
+                    data_source_id=data_source.data_source_id,
+                    observation_module=module,
+                    observation=assessment.probabilities[task.name].tolist(),
+                    confidence=float(np.max(assessment.probabilities[task.name])),
+                ))
+        self.pub_observation_data_source.publish(data_source)
+
+        # Whisper's transcript is the only speech this node produces; preserved for
+        # the conversation modules that consumed it from the previous version.
+        if assessment.note:
+            self.pub_speech.publish(ObservationDataSource(
+                data_source_id=data_source.data_source_id,
+                platform_name=self.platform_name,
+                audio_transcript=assessment.note))
+
+        self.pub_reasoning.publish(String(data=json.dumps({
+            'stamp': stamp.sec + stamp.nanosec * 1e-9,
+            'recording_name': str(self.get_parameter('recording_name').value),
+            'data_source_id': data_source.data_source_id,
+            'window_index': len(self.rows),
+            'start_s': round(start_s, 3),
+            'end_s': round(end_s, 3),
+            'backends': list(self.active_backends),
+            'transcript': assessment.note or '',
+            'probabilities': {task.name: {c: round(float(p), 6) for c, p in
+                                          zip(task.classes,
+                                              assessment.probabilities[task.name])}
+                              for task in self.tasks},
+            'latency_s': {k: round(v, 4) for k, v in assessment.latency_s.items()},
+        }, sort_keys=True)))
+
+        row = window_row(len(self.rows), start_s, end_s, audio, assessment, self.tasks,
+                         note_field='transcript')
+        with self.rows_lock:
+            self.rows.append(row)
+            if assessment.note:
+                self.notes.append((start_s, end_s, assessment.note))
+
+        self.get_logger().info(
+            f'[{start_s:6.1f}-{end_s:6.1f}s] ' + '  '.join(
+                f'{task.name}={row[f"{task.name}_pred"]}' for task in self.tasks)
+            + f'  {row["latency_s"]:.2f}s')
+
+    def finalize_callback(self, request, response):
+        """
+        Closes out the current recording: flushes the tail window, drains the
+        backlog, writes artifacts, and resets. Synchronous, so an evaluation harness
+        knows a recording is complete before the next one starts playing.
+        :return: the populated response
+        """
+        with self.buffer_lock:
+            tail = self.windower.flush()
+            duration_s = self.windower.duration_s
+            audio = self.windower.full_audio() if duration_s > 0 else np.zeros(0, np.int16)
+        if tail is not None:
+            self.work_queue.put(tail)
+        self.work_queue.join()
+
+        with self.rows_lock:
+            rows = list(self.rows)
+            notes = list(self.notes)
+        if not rows:
+            response.success = False
+            response.message = (f'No windows classified ({duration_s:.1f}s of audio '
+                                f'received); nothing written.')
+            self.get_logger().warning(response.message)
+            self._reset()
+            return response
+
+        message = f'{len(rows)} window(s) over {duration_s:.1f}s'
+        if bool(self.get_parameter('save_artifacts').value):
+            try:
+                writer = RecordingArtifactWriter(
+                    tasks=self.tasks,
+                    output_dir=str(self.get_parameter('output_dir').value),
+                    recording_name=str(self.get_parameter('recording_name').value),
+                    labels_json=str(self.get_parameter('labels_json').value),
+                    algorithm='+'.join(self.active_backends),
+                    metadata={'window_s': self.get_parameter('window_s').value,
+                              'hop_s': self.get_parameter('hop_s').value,
+                              'channel_mode': self.get_parameter('channel_mode').value,
+                              'whisper_vad': self.get_parameter('whisper_vad').value,
+                              'max_inference_backlog': self.max_backlog})
+                notes_text = '\n\n'.join(
+                    f'[{start:.0f}-{end:.0f}s]\n{text}' for start, end, text in notes)
+                directory = writer.write(rows, audio, duration_s, notes_text)
+                message += f'; artifacts in {directory}'
+            except Exception as exc:
+                self.get_logger().error(f'Failed writing artifacts: {exc}')
+                response.success = False
+                response.message = f'{message}; ARTIFACT WRITE FAILED: {exc}'
+                self._reset()
+                return response
+
+        response.success = True
+        response.message = message
+        self.get_logger().info(f'Finalized: {message}')
+        self._reset()
+        return response
+
+    def _reset(self) -> None:
+        with self.buffer_lock:
+            self.windower.reset()
+            self.recording_started_at = None
+        with self.rows_lock:
+            self.rows = []
+            self.notes = []
+        self.max_backlog = 0
+
+    def shutdown(self) -> None:
+        self.work_queue.put(_SHUTDOWN)
+        self.worker.join(timeout=5.0)
+
 
 def main(args=None) -> None:
     rclpy.init(args=args)
-    audio_classification_node = AudioClassificationNode('audio_classification_node')
-    executor = MultiThreadedExecutor()
-    rclpy.spin(audio_classification_node, executor=executor)
-    rclpy.shutdown()
+    node = None
+    try:
+        node = AudioClassificationNode()
+        rclpy.spin(node, executor=MultiThreadedExecutor())
+    except KeyboardInterrupt:
+        pass
+    finally:
+        if node is not None:
+            node.shutdown()
+            node.destroy_node()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

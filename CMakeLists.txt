@@ -15,6 +15,7 @@ find_package(diagnostic_updater REQUIRED)
 find_package(diagnostic_msgs REQUIRED)
 find_package(rclcpp REQUIRED)
 find_package(rclpy REQUIRED)
+find_package(std_srvs REQUIRED)
 
 
 if(BUILD_TESTING)
@@ -41,6 +42,10 @@ install(
 )
 install(
         PROGRAMS ${PROJECT_NAME}/audio_classification_node.py
+        DESTINATION lib/${PROJECT_NAME}
+)
+install(
+        PROGRAMS ${PROJECT_NAME}/gemma_audio_classification_node.py
         DESTINATION lib/${PROJECT_NAME}
 )
 install(
