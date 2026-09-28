@@ -17,7 +17,7 @@
 Classifies casualty audio with the AST + Whisper baseline, in the same shape as
 gemma_audio_classification_node.py so the two can be compared directly.
 
-Publishes, per analysis window, an Observation per label:
+Publishes, per analysis window, an ObservationWithLevel per label:
   ast_respiratory_distress  -- [P(absent), P(present)]
   ast_alertness_verbal      -- [P(normal), P(abnormal), P(absent)]
   whisper_alertness_verbal  -- [P(normal), P(abnormal), P(absent)], when Whisper runs
@@ -55,7 +55,7 @@ import random
 import threading
 
 from audio_common_msgs.msg import AudioDataStamped
-from cdcl_umd_msgs.msg import Observation, ObservationDataSource, SpotStatus
+from cdcl_umd_msgs.msg import ObservationWithLevel, ObservationDataSource, SpotStatus
 from cdcl_umd_msgs.srv import StopListening
 from microphone.ast_whisper_assessor import AstWhisperAssessor
 from microphone.audio_window_buffer import StreamingAudioWindower
@@ -180,7 +180,7 @@ class AudioClassificationNode(Node):
             SpotStatus, 'spot_status', self.spot_status_callback, qos_profile_sensor_data)
         self.assessing = not bool(self.get_parameter('require_assessing').value)
 
-        self.pub_observation = self.create_publisher(Observation, 'observation_no_id', 10)
+        self.pub_observation = self.create_publisher(ObservationWithLevel, 'observation_no_id', 10)
         self.pub_observation_data_source = self.create_publisher(
             ObservationDataSource, 'observation_data_sources', 10)
         self.pub_speech = self.create_publisher(ObservationDataSource, 'speech', 10)
@@ -288,7 +288,7 @@ class AudioClassificationNode(Node):
                 module = OBSERVATION_MODULES.get(backend, {}).get(task.name)
                 if module is None:
                     continue
-                self.pub_observation.publish(Observation(
+                self.pub_observation.publish(ObservationWithLevel(
                     stamp=stamp,
                     platform_name=self.platform_name,
                     data_source_id=data_source.data_source_id,

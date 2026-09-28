@@ -12,7 +12,7 @@
 Classifies casualty audio with a single unified Gemma 4 model, replacing the
 AST + Whisper pipeline in audio_classification_node.py.
 
-Subscribes to AudioDataStamped and publishes, per analysis window, an Observation for
+Subscribes to AudioDataStamped and publishes, per analysis window, an ObservationWithLevel for
 verbal alertness:
   gemma_audio_alertness_verbal     -- [P(normal), P(abnormal), P(absent)]
 
@@ -50,7 +50,7 @@ WHAT IT ADDS:
     Every published number can therefore be listened to and argued with afterwards.
 
 PUBLISHED TOPICS
-  observation_no_id              Observation, one per task per window
+  observation_no_id              ObservationWithLevel, one per task per window
   observation_data_sources       ObservationDataSource carrying the FULL window of
                                  16 kHz mono PCM those Observations were derived
                                  from, under the same data_source_id
@@ -88,7 +88,7 @@ import threading
 import wave
 
 from audio_common_msgs.msg import AudioDataStamped
-from cdcl_umd_msgs.msg import Observation, ObservationDataSource, SpotStatus
+from cdcl_umd_msgs.msg import ObservationWithLevel, ObservationDataSource, SpotStatus
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
@@ -250,7 +250,7 @@ class GemmaAudioClassificationNode(Node):
             self.robot_speech_callback, 10)
         self.assessing = not bool(self.get_parameter('require_assessing').value)
 
-        self.pub_observation = self.create_publisher(Observation, 'observation_no_id', 10)
+        self.pub_observation = self.create_publisher(ObservationWithLevel, 'observation_no_id', 10)
         self.pub_observation_data_source = self.create_publisher(
             ObservationDataSource, 'observation_data_sources', 10)
         # Everything the model wrote on its way to a number. Published as JSON in a
@@ -397,7 +397,7 @@ class GemmaAudioClassificationNode(Node):
         )
         stamp = self.get_clock().now().to_msg()
         for task in self.tasks:
-            self.pub_observation.publish(Observation(
+            self.pub_observation.publish(ObservationWithLevel(
                 stamp=stamp,
                 platform_name=self.platform_name,
                 data_source_id=data_source.data_source_id,
