@@ -3,7 +3,7 @@
 from audio_common_msgs.msg import AudioData, AudioDataStamped
 from cdcl_umd_msgs.srv import PlaySound
 from cdcl_umd_msgs.srv import StopListening
-from std_msgs.msg import Empty
+from std_msgs.msg import Empty, String
 import os
 import rclpy
 from rclpy.node import Node
@@ -44,6 +44,13 @@ class SpeakerNode(Node):
         # publish to a heartbeat topic every once in awhile
         self.empty_pub_ = self.create_publisher(Empty, 'speaker/heartbeat', 10)
         self.spot_voice_ = self.create_publisher(AudioDataStamped, 'speaker/voice', 10)
+
+        # What the robot says, as text, for anything downstream that has to tell the
+        # robot's voice apart from a person's. The audio classifier subscribes to this:
+        # knowing the exact words verbatim is strictly better than asking an audio
+        # model to recognize a synthetic voice, and mis-attributing the robot's own
+        # prompts to the casualty is the single largest error source it has.
+        self.spoken_text_pub_ = self.create_publisher(String, 'speaker/spoken_text', 10)
         
         self.heartbeat_timer_ = self.create_timer(2.5, self.heartbeat_callback)
 
@@ -120,6 +127,9 @@ class SpeakerNode(Node):
 
         # generate the .wav file
         self.get_logger().info(f"Received play sound request \"{request.text.lower()}\"")
+        # Published before playback rather than after, so a subscriber buffering by
+        # arrival time has the text in hand for the window the speech lands in.
+        self.spoken_text_pub_.publish(String(data=request.text))
         self._run_tts(request.text.lower())
 
         # check that file exists
